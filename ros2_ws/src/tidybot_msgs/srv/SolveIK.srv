@@ -1,0 +1,37 @@
+# Inverse kinematics service request
+# Computes joint positions for a target end-effector pose
+
+# Arm to solve IK for: "right" or "left"
+string arm_name
+
+# Target end-effector pose in base_link frame
+geometry_msgs/Pose target_pose
+
+# Optional: Initial joint positions as seed for solver (5 values)
+# If empty, uses current joint positions
+float64[] seed_joint_positions
+
+# Whether to consider orientation in the solution
+# If false, only position is matched
+bool use_orientation
+
+# Maximum time allowed for solving in seconds
+float64 timeout
+
+---
+
+# Whether a valid IK solution was found
+bool success
+
+# Joint positions solution (5 values)
+# Order: waist, shoulder, elbow, wrist_angle, wrist_rotate
+float64[] joint_positions
+
+# Residual position error in meters
+float64 position_error
+
+# Residual orientation error in radians
+float64 orientation_error
+
+# Status message (e.g., "Success", "No solution found", "Timeout")
+string message

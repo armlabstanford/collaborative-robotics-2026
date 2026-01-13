@@ -1,0 +1,369 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="tidybot_wx200_bimanual">
+
+  <!-- Material definitions -->
+  <material name="silver">
+    <color rgba="0.75 0.75 0.75 1"/>
+  </material>
+  <material name="dark_grey">
+    <color rgba="0.3 0.3 0.3 1"/>
+  </material>
+
+  <!-- Mesh path macro -->
+  <xacro:property name="mesh_path" value="package://tidybot_description/meshes"/>
+
+  <!-- ==================== BASE LINK ==================== -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <mesh filename="${mesh_path}/base/new_tidybot.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="silver"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="${mesh_path}/base/new_tidybot.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0.035"/>
+      <mass value="60"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+
+  <!-- Odom frame for mobile base -->
+  <link name="odom"/>
+  <joint name="odom_to_base" type="floating">
+    <parent link="odom"/>
+    <child link="base_link"/>
+  </joint>
+
+  <!-- ==================== CAMERA TOWER (EXTRUSION) ==================== -->
+  <link name="camera_tower">
+    <visual>
+      <origin xyz="0.13 -0.01 0.3847" rpy="0 0 1.5708"/>
+      <geometry>
+        <mesh filename="${mesh_path}/base/2020_extrusion_250mm.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="silver"/>
+    </visual>
+  </link>
+  <joint name="base_to_camera_tower" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_tower"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ==================== PAN-TILT CAMERA SYSTEM ==================== -->
+  <link name="pan_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 1.5708"/>
+      <geometry>
+        <mesh filename="${mesh_path}/locobot_pantilt/locobot_pan.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="dark_grey"/>
+    </visual>
+    <inertial>
+      <origin xyz="0.012 0.000496 0.018504"/>
+      <mass value="0.098997"/>
+      <inertia ixx="0.0000276300" ixy="0" ixz="0" iyy="0.0000204300" iyz="0" izz="0.0000276300"/>
+    </inertial>
+  </link>
+  <joint name="camera_pan" type="revolute">
+    <parent link="base_link"/>
+    <child link="pan_link"/>
+    <origin xyz="0.12 0 0.6347" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.5708" upper="1.5708" effort="2" velocity="1.0"/>
+    <dynamics damping="0.1"/>
+  </joint>
+
+  <link name="tilt_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 1.5708"/>
+      <geometry>
+        <mesh filename="${mesh_path}/locobot_pantilt/locobot_tilt.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="dark_grey"/>
+    </visual>
+    <inertial>
+      <origin xyz="0.0237737 0 0"/>
+      <mass value="0.019845"/>
+      <inertia ixx="0.0000021677" ixy="0" ixz="0" iyy="0.0000063634" iyz="0" izz="0.0000066157"/>
+    </inertial>
+  </link>
+  <joint name="camera_tilt" type="revolute">
+    <parent link="pan_link"/>
+    <child link="tilt_link"/>
+    <origin xyz="0.025034 0 0.019" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.5708" upper="1.309" effort="2" velocity="1.0"/>
+    <dynamics damping="0.1"/>
+  </joint>
+
+  <link name="camera_link">
+    <visual>
+      <geometry>
+        <mesh filename="${mesh_path}/locobot_pantilt/locobot_camera.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="dark_grey"/>
+    </visual>
+    <inertial>
+      <origin xyz="-0.008972 -0.015818 0.000003"/>
+      <mass value="0.072"/>
+      <inertia ixx="0.0000465400" ixy="0" ixz="0" iyy="0.0000069128" iyz="0" izz="0.0000468600"/>
+    </inertial>
+  </link>
+  <joint name="tilt_to_camera" type="fixed">
+    <parent link="tilt_link"/>
+    <child link="camera_link"/>
+    <origin xyz="0.05318 0.0175 0.000009" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Camera optical frames (Z forward, X right, Y down - standard ROS convention) -->
+  <link name="d435_color_optical_frame"/>
+  <joint name="camera_to_color_optical" type="fixed">
+    <parent link="camera_link"/>
+    <child link="d435_color_optical_frame"/>
+    <origin xyz="0 0 0" rpy="-1.5708 0 -1.5708"/>
+  </joint>
+
+  <link name="d435_depth_optical_frame"/>
+  <joint name="camera_to_depth_optical" type="fixed">
+    <parent link="camera_link"/>
+    <child link="d435_depth_optical_frame"/>
+    <origin xyz="0 0 0" rpy="-1.5708 0 -1.5708"/>
+  </joint>
+
+  <!-- ==================== WX200 ARM MACRO ==================== -->
+  <xacro:macro name="wx200_arm" params="prefix y_offset">
+
+    <link name="${prefix}_arm_base_link">
+      <visual>
+        <!-- Quaternion [0.5,0.5,0.5,0.5] from MuJoCo = RPY [pi/2, 0, pi/2] -->
+        <origin xyz="-0.095773 0 -0.10565" rpy="1.5708 0 1.5708"/>
+        <geometry>
+          <mesh filename="${mesh_path}/wx200/mobile_wx200_1_base.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="dark_grey"/>
+      </visual>
+    </link>
+    <joint name="base_to_${prefix}_arm" type="fixed">
+      <parent link="base_link"/>
+      <child link="${prefix}_arm_base_link"/>
+      <origin xyz="0.1199 ${y_offset} 0.3847" rpy="0 0 0"/>
+    </joint>
+
+    <link name="${prefix}_shoulder_link">
+      <visual>
+        <origin xyz="0 0 -0.003" rpy="0 0 1.5708"/>
+        <geometry>
+          <mesh filename="${mesh_path}/wx200/mobile_wx200_2_shoulder.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="dark_grey"/>
+      </visual>
+      <inertial>
+        <origin xyz="0.0000223 0.0000415 0.0066287"/>
+        <mass value="0.480879"/>
+        <inertia ixx="0.000379" ixy="0" ixz="0" iyy="0.000556" iyz="0" izz="0.000589"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_waist" type="revolute">
+      <parent link="${prefix}_arm_base_link"/>
+      <child link="${prefix}_shoulder_link"/>
+      <origin xyz="0 0 0.066175" rpy="0 0 0"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="-3.14159" upper="3.14159" effort="25" velocity="3.14"/>
+      <dynamics damping="0.1"/>
+    </joint>
+
+    <link name="${prefix}_upper_arm_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 1.5708"/>
+        <geometry>
+          <mesh filename="${mesh_path}/wx200/mobile_wx200_3_upper_arm.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="dark_grey"/>
+      </visual>
+      <inertial>
+        <origin xyz="0.01197 -0.000118 0.13943"/>
+        <mass value="0.297781"/>
+        <inertia ixx="0.00171" ixy="0" ixz="0" iyy="0.001631" iyz="0" izz="0.000148"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_shoulder" type="revolute">
+      <parent link="${prefix}_shoulder_link"/>
+      <child link="${prefix}_upper_arm_link"/>
+      <origin xyz="0 0 0.03865" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <limit lower="-1.8849" upper="1.9722" effort="105" velocity="3.14"/>
+      <dynamics damping="0.1"/>
+    </joint>
+
+    <link name="${prefix}_forearm_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 1.5708"/>
+        <geometry>
+          <mesh filename="${mesh_path}/wx200/mobile_wx200_4_forearm.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="dark_grey"/>
+      </visual>
+      <inertial>
+        <origin xyz="0.12119 -0.000124 0"/>
+        <mass value="0.283651"/>
+        <inertia ixx="0.001185" ixy="0" ixz="0" iyy="0.0000683" iyz="0" izz="0.001206"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_elbow" type="revolute">
+      <parent link="${prefix}_upper_arm_link"/>
+      <child link="${prefix}_forearm_link"/>
+      <origin xyz="0.05 0 0.2" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <limit lower="-1.8849" upper="1.6232" effort="75" velocity="3.14"/>
+      <dynamics damping="0.1"/>
+    </joint>
+
+    <link name="${prefix}_wrist_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 1.5708"/>
+        <geometry>
+          <mesh filename="${mesh_path}/wx200/mobile_wx200_5_wrist.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="dark_grey"/>
+      </visual>
+      <inertial>
+        <origin xyz="0.04236 -0.0000107 0.010577"/>
+        <mass value="0.084957"/>
+        <inertia ixx="0.0000308" ixy="0" ixz="0" iyy="0.0000282" iyz="0" izz="0.0000315"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_wrist_angle" type="revolute">
+      <parent link="${prefix}_forearm_link"/>
+      <child link="${prefix}_wrist_link"/>
+      <origin xyz="0.2 0 0" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <limit lower="-1.7453" upper="2.1468" effort="25" velocity="3.14"/>
+      <dynamics damping="0.1"/>
+    </joint>
+
+    <link name="${prefix}_gripper_link">
+      <visual>
+        <origin xyz="-0.02 0 0" rpy="0 0 1.5708"/>
+        <geometry>
+          <mesh filename="${mesh_path}/wx200/mobile_wx200_6_gripper.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="dark_grey"/>
+      </visual>
+      <inertial>
+        <origin xyz="0.02163 0 0.01141"/>
+        <mass value="0.072885"/>
+        <inertia ixx="0.0000254" ixy="0" ixz="0" iyy="0.0000184" iyz="0" izz="0.0000167"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_wrist_rotate" type="revolute">
+      <parent link="${prefix}_wrist_link"/>
+      <child link="${prefix}_gripper_link"/>
+      <origin xyz="0.065 0 0" rpy="0 0 0"/>
+      <axis xyz="1 0 0"/>
+      <limit lower="-3.14159" upper="3.14159" effort="25" velocity="3.14"/>
+      <dynamics damping="0.1"/>
+    </joint>
+
+    <link name="${prefix}_ee_arm_link">
+      <inertial>
+        <mass value="0.001"/>
+        <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_gripper_to_ee" type="fixed">
+      <parent link="${prefix}_gripper_link"/>
+      <child link="${prefix}_ee_arm_link"/>
+      <origin xyz="0.043 0 0" rpy="0 0 0"/>
+    </joint>
+
+    <link name="${prefix}_gripper_bar_link">
+      <visual>
+        <origin xyz="-0.063 0 0" rpy="0 0 1.5708"/>
+        <geometry>
+          <mesh filename="${mesh_path}/wx200/mobile_wx200_8_gripper_bar.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="dark_grey"/>
+      </visual>
+    </link>
+    <joint name="${prefix}_ee_to_bar" type="fixed">
+      <parent link="${prefix}_ee_arm_link"/>
+      <child link="${prefix}_gripper_bar_link"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </joint>
+
+    <link name="${prefix}_fingers_link"/>
+    <joint name="${prefix}_bar_to_fingers" type="fixed">
+      <parent link="${prefix}_gripper_bar_link"/>
+      <child link="${prefix}_fingers_link"/>
+      <origin xyz="0.023 0 0" rpy="0 0 0"/>
+    </joint>
+
+    <!-- Left finger -->
+    <link name="${prefix}_left_finger_link">
+      <visual>
+        <origin xyz="0 0.005 0" rpy="3.14159 3.14159 0"/>
+        <geometry>
+          <mesh filename="${mesh_path}/wx200/mobile_wx200_9_gripper_finger.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="dark_grey"/>
+      </visual>
+      <inertial>
+        <origin xyz="0.01382 0 0"/>
+        <mass value="0.016246"/>
+        <inertia ixx="0.00000473" ixy="0" ixz="0" iyy="0.00000155" iyz="0" izz="0.00000375"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_left_finger" type="prismatic">
+      <parent link="${prefix}_fingers_link"/>
+      <child link="${prefix}_left_finger_link"/>
+      <origin xyz="0 0.015 0" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <limit lower="0" upper="0.022" effort="10" velocity="0.1"/>
+      <dynamics damping="0.1"/>
+    </joint>
+
+    <!-- Right finger -->
+    <link name="${prefix}_right_finger_link">
+      <visual>
+        <origin xyz="0 -0.005 0" rpy="0 3.14159 0"/>
+        <geometry>
+          <mesh filename="${mesh_path}/wx200/mobile_wx200_9_gripper_finger.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="dark_grey"/>
+      </visual>
+      <inertial>
+        <origin xyz="0.01382 0 0"/>
+        <mass value="0.016246"/>
+        <inertia ixx="0.00000473" ixy="0" ixz="0" iyy="0.00000155" iyz="0" izz="0.00000375"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_right_finger" type="prismatic">
+      <parent link="${prefix}_fingers_link"/>
+      <child link="${prefix}_right_finger_link"/>
+      <origin xyz="0 -0.015 0" rpy="0 0 0"/>
+      <axis xyz="0 -1 0"/>
+      <limit lower="0" upper="0.022" effort="10" velocity="0.1"/>
+      <dynamics damping="0.1"/>
+    </joint>
+
+    <!-- End-effector (pinch site) -->
+    <link name="${prefix}_pinch_site"/>
+    <joint name="${prefix}_pinch_joint" type="fixed">
+      <parent link="${prefix}_fingers_link"/>
+      <child link="${prefix}_pinch_site"/>
+      <origin xyz="0.027575 0 0" rpy="0 0 0"/>
+    </joint>
+
+  </xacro:macro>
+
+  <!-- Instantiate both arms -->
+  <xacro:wx200_arm prefix="right" y_offset="-0.15"/>
+  <xacro:wx200_arm prefix="left" y_offset="0.15"/>
+
+</robot>

@@ -1,0 +1,19 @@
+# MuJoCo Bridge simulation parameters
+
+mujoco_bridge:
+  ros__parameters:
+    # Simulation rate (Hz) - how fast MuJoCo steps
+    # Higher = more accurate physics but more CPU
+    sim_rate: 500.0
+
+    # Joint state publish rate (Hz)
+    publish_rate: 100.0
+
+    # Camera image publish rate (Hz)
+    camera_rate: 30.0
+
+    # Show MuJoCo viewer window
+    show_viewer: true
+
+    # Path to MuJoCo model (empty = use default)
+    model_path: ""

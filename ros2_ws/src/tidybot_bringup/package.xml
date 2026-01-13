@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>tidybot_bringup</name>
+  <version>0.1.0</version>
+  <description>Launch files for TidyBot2 - simulation and real hardware</description>
+  <maintainer email="aqiu34@stanford.edu, mastro1@stanford.edu">Alex Qiu and Matt Strong</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>tidybot_description</exec_depend>
+  <exec_depend>tidybot_msgs</exec_depend>
+  <exec_depend>tidybot_mujoco_bridge</exec_depend>
+  <exec_depend>tidybot_control</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
