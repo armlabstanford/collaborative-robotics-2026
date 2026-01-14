@@ -1,0 +1,39 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# ROS2 build artifacts
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Git
+.git/
+.gitignore
+
+# Docker (don't copy Docker folder into image)
+Docker/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Simulation outputs
+simulation/scripts/captures/
+
+# Claude
+CLAUDE.md
+.claude/
+
+# Misc
+*.log
+*.tmp

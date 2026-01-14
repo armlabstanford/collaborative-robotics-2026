@@ -1,5 +1,12 @@
 # CLAUDE.md - Development Guide
 
+## Rules for Claude
+
+1. **Always commit and push changes** - After making code changes, Claude should add, commit, and push to the repository (unless the user specifies otherwise).
+2. **Use descriptive commit messages** - Summarize what was changed and why.
+3. **Test before committing** - Ensure changes work before pushing.
+4. **Update documentation** - Keep README.md and CLAUDE.md up to date with any significant changes.
+
 ## Project Overview
 
 **TidyBot2** - A mobile robot platform with bimanual WX200 6-DOF arms for Stanford's Collaborative Robotics class. This repository provides MuJoCo simulation and ROS2 control software.
@@ -208,6 +215,29 @@ Managed via `uv` (see `pyproject.toml`):
 - opencv-python >= 4.0.0
 - mink >= 0.0.6 (trajectory optimization)
 - pyrealsense2 >= 2.55.0
+
+## Docker
+
+Build and run with VNC desktop access:
+
+```bash
+# Build (from repo root)
+docker build -f Docker/Dockerfile -t tidybot2:humble .
+
+# Run
+docker run -p 6080:80 --shm-size=2g tidybot2:humble
+
+# Access via browser: http://127.0.0.1:6080/
+```
+
+**Available commands in container:**
+| Command | Description |
+|---------|-------------|
+| `tidybot-sim` | MuJoCo standalone simulation |
+| `tidybot-ros` | ROS2 + RViz + MuJoCo |
+| `tidybot-ros-no-rviz` | ROS2 + MuJoCo (no RViz) |
+| `tidybot-test-base` | Test base movement |
+| `tidybot-test-arms` | Test arm control |
 
 ## Authors
 
