@@ -11,15 +11,22 @@ There are two ways to get started:
 Use our pre-built Docker image with VNC desktop access. Works on any OS (Windows, macOS, Linux).
 
 ```bash
-# Pull the image
+# 1. Clone the repo
+git clone https://github.com/armlabstanford/collaborative-robotics-2026.git
+cd collaborative-robotics-2026
+
+# 2. Pull the image
 docker pull peasant98/tidybot2:humble
 
-# Run the container
-docker run -p 6080:80 --shm-size=2g peasant98/tidybot2:humble
+# 3. Run with the repo mounted (changes sync between host and container)
+docker run -p 6080:80 --shm-size=2g \
+    -v $(pwd):/home/ubuntu/Desktop/collaborative \
+    peasant98/tidybot2:humble
 
-# Access via browser
-# Open http://127.0.0.1:6080/
+# Access via browser: http://127.0.0.1:6080/
 ```
+
+**Syncing updates:** With the volume mount, any `git pull` on your host machine will immediately reflect inside the running container.
 
 **Available commands in container:**
 | Command | Description |
