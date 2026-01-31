@@ -67,7 +67,7 @@ class TestBase(Node):
 
         # Send velocity commands for 1 second
         start = time.time()
-        while (time.time() - start) < 1.0:
+        while (time.time() - start) < 5.0:
             self.cmd_vel_pub.publish(vel)
             rclpy.spin_once(self, timeout_sec=0.05)
 

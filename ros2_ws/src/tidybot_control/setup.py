@@ -27,6 +27,7 @@ setup(
             'phoenix6_base_node = tidybot_control.phoenix6_base_node:main',
             'pan_tilt_node = tidybot_control.pan_tilt_node:main',
             'dynamixel_bus_node = tidybot_control.dynamixel_bus_node:main',
+            'gripper_wrapper_node = tidybot_control.gripper_wrapper_node:main',
         ],
     },
 )

@@ -16,12 +16,19 @@ from sensor_msgs.msg import JointState
 
 
 class TestGrippers(Node):
+    """
+    Test grippers using simulation-compatible interface.
+
+    Uses the same /right_gripper/cmd and /left_gripper/cmd topics
+    as the MuJoCo simulation, so this script works for both sim and real.
+    """
+
     def __init__(self):
         super().__init__('test_grippers_real')
 
         self.joint_states_received = False
 
-        # Publishers
+        # Publishers - same interface as MuJoCo simulation
         self.right_gripper_pub = self.create_publisher(
             Float64MultiArray, '/right_gripper/cmd', 10
         )
@@ -42,9 +49,9 @@ class TestGrippers(Node):
             self.get_logger().info('Connected!')
 
     def send_gripper_command(self, value, duration=1.0):
-        """Send gripper command (0=open, 1=closed)."""
+        """Send gripper command (0.0 = open, 1.0 = closed)."""
         msg = Float64MultiArray()
-        msg.data = [value]
+        msg.data = [float(value)]
 
         for _ in range(int(duration * 20)):
             self.right_gripper_pub.publish(msg)

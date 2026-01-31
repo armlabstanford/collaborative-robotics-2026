@@ -166,6 +166,15 @@ def launch_setup(context, *args, **kwargs):
                 output='screen',
             ))
 
+        # Gripper wrapper - translates sim-compatible /right_gripper/cmd and /left_gripper/cmd
+        # to Interbotix SDK commands for seamless sim-to-real transfer
+        nodes.append(Node(
+            package='tidybot_control',
+            executable='gripper_wrapper_node',
+            name='gripper_wrapper',
+            output='screen',
+        ))
+
     # RealSense camera
     if use_camera:
         nodes.append(Node(

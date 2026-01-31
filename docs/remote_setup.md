@@ -76,7 +76,7 @@ You run **real ROS2 nodes** on your machine, not a custom client library. This:
 
 ```bash
 # SSH into robot
-ssh locobot@192.169.1.7 # NUC Ip address
+ssh locobot@192.169.1.7 # NUC Ip address # ssh password: locobot
 
 # Set up environment
 export ROS_DOMAIN_ID=42
@@ -111,6 +111,12 @@ You should see topics like:
 /left_arm/command
 /camera/color/image_raw
 ...
+```
+
+If you don't see ros2 topics, try disabling your local network firewall (as well as on the NUC):
+
+```
+sudo ufw disable
 ```
 
 ### Step 3: Control the Robot
