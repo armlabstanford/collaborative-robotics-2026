@@ -303,9 +303,16 @@ class Phoenix6BaseNode(Node):
         odom.pose.pose.position.y = y
         odom.pose.pose.position.z = 0.0
 
+        # Apply pi/2 yaw offset to match URDF mesh convention.
+        # The Vehicle class uses theta=0 for forward (+X), but the URDF mesh
+        # faces -Y at joint_th=0 (same as MuJoCo model), so joint_th=pi/2
+        # means forward. Adding pi/2 aligns the RViz visualization with the
+        # actual robot heading.
+        th_odom = th + math.pi / 2
+
         # Convert yaw to quaternion
-        cy = math.cos(th * 0.5)
-        sy = math.sin(th * 0.5)
+        cy = math.cos(th_odom * 0.5)
+        sy = math.sin(th_odom * 0.5)
         odom.pose.pose.orientation.x = 0.0
         odom.pose.pose.orientation.y = 0.0
         odom.pose.pose.orientation.z = sy
