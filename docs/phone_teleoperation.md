@@ -85,7 +85,7 @@ ros2 run tidybot_control phone_teleop_server
 ### Step 3: Connect Your Phone
 
 1. Open **XRViewer** (iPhone) or **Chrome** (Android)
-2. Navigate to `http://<ROBOT_IP>:5000`
+2. Navigate to `http://192.168.0.208:5000`
 3. Tap **"Start episode"** to begin the WebXR AR session
 4. The camera view will appear with a semi-transparent overlay
 
