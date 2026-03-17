@@ -53,8 +53,7 @@ from scipy.spatial.transform import Rotation as R
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose2D, Twist
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
@@ -80,8 +79,15 @@ JOINT_NAMES = list(JOINT_LIMITS.keys())
 
 # Control parameters
 CONTROL_RATE = 20                # Hz
-MAX_JOINT_VELOCITY = 1.0         # rad/s per joint (velocity limit)
+MAX_JOINT_VELOCITY = 0.5         # rad/s per joint (velocity limit)
 MESSAGE_TIMEOUT_MS = 250         # Ignore stale WebXR messages
+
+# Base velocity control parameters
+BASE_LINEAR_GAIN = 3.0           # m/s per meter of phone displacement
+BASE_ANGULAR_GAIN = 2.0          # rad/s per radian of phone yaw
+BASE_MAX_LINEAR_VEL = 0.5        # m/s cap
+BASE_MAX_ANGULAR_VEL = 1.0       # rad/s cap
+BASE_DEADZONE = 0.01             # meters — ignore phone displacement smaller than this
 
 # WebXR coordinate conversion
 DEVICE_CAMERA_OFFSET = np.array([0.0, 0.02, -0.04])
@@ -299,7 +305,7 @@ class ArmIKController:
 # ---------------------------------------------------------------------------
 
 class TeleopController:
-    """Processes WebXR messages and computes base/arm targets."""
+    """Processes WebXR messages and computes base velocity + arm targets."""
 
     def __init__(self, ik_controller):
         self.ik = ik_controller
@@ -309,40 +315,27 @@ class TeleopController:
         self.secondary_device_id = None
         self.enabled_counts = {}
 
-        # Robot state
-        self.base_pose = np.array([0.0, 0.0, 0.0])
-
-        # Targets
-        self.targets_initialized = False
-        self.base_target_pose = None
-
         # WebXR reference poses
         self.base_xr_ref_pos = None
-        self.base_xr_ref_rot_inv = None
+        self.base_xr_ref_yaw = None
         self.arm_xr_ref_pos = None
         self.arm_xr_ref_rot_inv = None
 
         # Robot reference poses
-        self.base_ref_pose = None
         self.arm_ref_ee_pos = None     # EE position at touch start
         self.arm_ref_ee_rot = None     # EE rotation at touch start
+
+        # Base velocity output (set each frame, zeroed on release)
+        self.base_cmd_vel = np.array([0.0, 0.0, 0.0])  # [vx, vy, wz]
+        self.base_control_active = False
 
         # Arm IK output
         self.arm_target_joints = None  # Target joint positions from IK
         self.arm_control_active = False
         self.gripper_delta = 0.0
 
-    def update_base_pose(self, x, y, theta):
-        self.base_pose = np.array([x, y, theta])
-        if not self.targets_initialized:
-            self.base_target_pose = self.base_pose.copy()
-            self.targets_initialized = True
-
     def process_message(self, data, current_arm_positions, active_arm):
-        """Process a WebXR message. Returns base target pose or None."""
-        if not self.targets_initialized:
-            return None
-
+        """Process a WebXR message. Updates base_cmd_vel and arm targets."""
         device_id = data.get('device_id', 'default')
 
         # Update enabled count
@@ -363,8 +356,9 @@ class TeleopController:
                 self.base_xr_ref_pos = None
                 self.arm_xr_ref_pos = None
                 self.arm_control_active = False
-                # Stop base at current position so robot doesn't keep driving
-                self.base_target_pose = self.base_pose.copy()
+                # Zero velocity on release
+                self.base_cmd_vel[:] = 0.0
+                self.base_control_active = False
             elif device_id == self.secondary_device_id:
                 self.secondary_device_id = None
                 self.base_xr_ref_pos = None
@@ -372,29 +366,47 @@ class TeleopController:
         # Process teleop commands
         if self.primary_device_id is not None and 'teleop_mode' in data:
             if 'position' not in data or 'orientation' not in data:
-                return None
+                return
 
             pos, rot = convert_webxr_pose(data['position'], data['orientation'])
 
-            # --- BASE CONTROL ---
+            # --- BASE CONTROL (velocity from phone displacement) ---
             if data['teleop_mode'] == 'base' or device_id == self.secondary_device_id:
                 if self.base_xr_ref_pos is None:
-                    self.base_ref_pose = self.base_pose.copy()
-                    self.base_xr_ref_pos = pos[:2].copy()
-                    self.base_xr_ref_rot_inv = rot.inv()
+                    # Capture reference: phone horizontal position + yaw
+                    self.base_xr_ref_pos = pos[:2].copy()  # XY only (horizontal)
+                    # Extract yaw from phone orientation
+                    euler = rot.as_euler('ZYX')  # [yaw, pitch, roll]
+                    self.base_xr_ref_yaw = euler[0]
 
-                self.base_target_pose[:2] = (
-                    self.base_ref_pose[:2] + (pos[:2] - self.base_xr_ref_pos))
+                # Horizontal displacement from reference (XY plane only)
+                delta_xy = pos[:2] - self.base_xr_ref_pos
 
-                base_fwd = (rot * self.base_xr_ref_rot_inv).apply([1.0, 0.0, 0.0])
-                base_target_theta = self.base_ref_pose[2] + math.atan2(base_fwd[1], base_fwd[0])
-                self.base_target_pose[2] += (
-                    (base_target_theta - self.base_target_pose[2] + math.pi) % TWO_PI - math.pi)
+                # Apply deadzone
+                dist = np.linalg.norm(delta_xy)
+                if dist < BASE_DEADZONE:
+                    delta_xy = np.array([0.0, 0.0])
 
+                # Scale displacement to velocity
+                vx = np.clip(delta_xy[0] * BASE_LINEAR_GAIN,
+                             -BASE_MAX_LINEAR_VEL, BASE_MAX_LINEAR_VEL)
+                vy = np.clip(delta_xy[1] * BASE_LINEAR_GAIN,
+                             -BASE_MAX_LINEAR_VEL, BASE_MAX_LINEAR_VEL)
+
+                # Yaw delta → angular velocity
+                euler = rot.as_euler('ZYX')
+                yaw_delta = (euler[0] - self.base_xr_ref_yaw + math.pi) % TWO_PI - math.pi
+                wz = np.clip(yaw_delta * BASE_ANGULAR_GAIN,
+                             -BASE_MAX_ANGULAR_VEL, BASE_MAX_ANGULAR_VEL)
+
+                self.base_cmd_vel = np.array([vx, vy, wz])
+                self.base_control_active = True
                 self.arm_control_active = False
 
             # --- ARM CONTROL (Cartesian IK) ---
             elif data['teleop_mode'] == 'arm':
+                self.base_control_active = False
+
                 if self.arm_xr_ref_pos is None:
                     # Capture reference: phone pose + current EE pose via FK
                     self.arm_xr_ref_pos = pos.copy()
@@ -417,7 +429,6 @@ class TeleopController:
                     target_ee_rot = delta_rot.as_matrix() @ self.arm_ref_ee_rot
 
                     # Solve IK
-                    other_arm = 'left' if active_arm == 'right' else 'right'
                     success, joints = self.ik.solve_ik(
                         active_arm,
                         target_ee_pos, target_ee_rot,
@@ -431,12 +442,11 @@ class TeleopController:
                 # Gripper from vertical swipe
                 self.gripper_delta = data.get('gripper_delta', 0.0)
 
-        # Teleop disabled
+        # Teleop disabled — zero everything
         elif self.primary_device_id is None:
-            self.base_target_pose = self.base_pose.copy()
+            self.base_cmd_vel[:] = 0.0
+            self.base_control_active = False
             self.arm_control_active = False
-
-        return self.base_target_pose.copy() if self.targets_initialized else None
 
 
 class PhoneTeleopNode(Node):
@@ -449,7 +459,6 @@ class PhoneTeleopNode(Node):
         self.declare_parameter('host', '0.0.0.0')
 
         # Publishers
-        self.base_target_pub = self.create_publisher(Pose2D, '/base/target_pose', 10)
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.right_arm_pub = self.create_publisher(Float64MultiArray, '/right_arm/joint_cmd', 10)
         self.left_arm_pub = self.create_publisher(Float64MultiArray, '/left_arm/joint_cmd', 10)
@@ -458,7 +467,6 @@ class PhoneTeleopNode(Node):
         self.pan_tilt_pub = self.create_publisher(Float64MultiArray, '/camera/pan_tilt_cmd', 10)
 
         # Subscribers
-        self.create_subscription(Odometry, '/odom', self._odom_cb, 10)
         self.right_arm_positions = list(SLEEP_POSE)
         self.left_arm_positions = list(SLEEP_POSE)
         self.create_subscription(JointState, '/right_arm/joint_states', self._right_js_cb, 10)
@@ -485,14 +493,6 @@ class PhoneTeleopNode(Node):
         self.control_timer = self.create_timer(1.0 / CONTROL_RATE, self._control_loop)
 
         self.get_logger().info('PhoneTeleopNode initialized (WebXR + Cartesian IK)')
-
-    def _odom_cb(self, msg):
-        pos = msg.pose.pose.position
-        quat = msg.pose.pose.orientation
-        siny_cosp = 2.0 * (quat.w * quat.z + quat.x * quat.y)
-        cosy_cosp = 1.0 - 2.0 * (quat.y * quat.y + quat.z * quat.z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-        self.teleop.update_base_pose(pos.x, pos.y, yaw)
 
     def _right_js_cb(self, msg):
         if len(msg.position) >= 6:
@@ -529,18 +529,19 @@ class PhoneTeleopNode(Node):
                 break
 
         if latest_data is not None:
-            base_target = self.teleop.process_message(
+            self.teleop.process_message(
                 latest_data, current_positions, active_arm)
 
-            # Publish base target (including stop-in-place when touch released)
-            if base_target is not None:
-                msg = Pose2D()
-                msg.x = float(base_target[0])
-                msg.y = float(base_target[1])
-                msg.theta = float(base_target[2])
-                self.base_target_pub.publish(msg)
+        # --- Base: publish cmd_vel (always, so zero gets sent on release) ---
+        twist = Twist()
+        if self.teleop.base_control_active:
+            twist.linear.x = float(self.teleop.base_cmd_vel[0])
+            twist.linear.y = float(self.teleop.base_cmd_vel[1])
+            twist.angular.z = float(self.teleop.base_cmd_vel[2])
+        # else: twist stays all zeros → robot stops
+        self.cmd_vel_pub.publish(twist)
 
-        # Arm: velocity-limited interpolation toward IK target
+        # --- Arm: velocity-limited interpolation toward IK target ---
         if self.teleop.arm_control_active and self.teleop.arm_target_joints is not None:
             target = self.teleop.arm_target_joints
 
@@ -617,6 +618,8 @@ class PhoneTeleopNode(Node):
 
     def emergency_stop(self):
         self.teleop.arm_control_active = False
+        self.teleop.base_control_active = False
+        self.teleop.base_cmd_vel[:] = 0.0
         self.teleop.primary_device_id = None
         self.teleop.base_xr_ref_pos = None
         self.teleop.arm_xr_ref_pos = None
@@ -905,17 +908,18 @@ WEBXR_HTML = r"""<!doctype html>
     }
     header { padding: 0.5em; background-color: rgba(255,255,255,0.90); }
     #info { font-size: 1.25em; background-color: rgba(240,240,240,0.5); }
-    #arm-controls { padding: 0.5em; background-color: rgba(255,255,255,0.85); }
+    #arm-controls { padding: 0.4em; background-color: rgba(255,255,255,0.85); }
+    #arm-controls { display: flex; flex-wrap: nowrap; align-items: center; gap: 3px; }
     #arm-controls button {
-      padding: 8px 16px; margin: 4px; border-radius: 6px;
-      border: 2px solid #333; background: #fff; font-size: 14px;
-      font-weight: 600; cursor: pointer;
+      padding: 5px 8px; border-radius: 5px;
+      border: 2px solid #333; background: #fff; font-size: 11px;
+      font-weight: 600; cursor: pointer; white-space: nowrap;
     }
     #arm-controls button.active { background: #4a90d9; color: #fff; border-color: #4a90d9; }
     #arm-controls .grip-btn { background: #27ae60; color: #fff; border-color: #27ae60; }
     #arm-controls .grip-btn.closed { background: #e74c3c; border-color: #e74c3c; }
     #arm-controls .preset-btn { background: #95a5a6; color: #fff; border-color: #7f8c8d; }
-    #arm-controls .stop-btn { background: #c0392b; color: #fff; border-color: #a93226; font-size: 16px; }
+    #arm-controls .stop-btn { background: #c0392b; color: #fff; border-color: #a93226; font-size: 11px; }
     canvas {
       position: absolute; z-index: 0;
       width: 100%; height: 100%;
@@ -928,7 +932,7 @@ WEBXR_HTML = r"""<!doctype html>
   <div id="overlay">
     <header></header>
     <div id="arm-controls">
-      <span style="font-weight:700; font-size:14px;">Arm:</span>
+      <span style="font-weight:700; font-size:11px; white-space:nowrap;">Arm:</span>
       <button class="active" id="btn-right" onclick="selectArm('right')">Right</button>
       <button id="btn-left" onclick="selectArm('left')">Left</button>
       <button class="grip-btn" id="grip-btn" onclick="toggleGripper()">Gripper: OPEN</button>
