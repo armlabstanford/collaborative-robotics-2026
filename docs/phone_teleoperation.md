@@ -95,17 +95,16 @@ The control scheme matches the [upstream tidybot2](https://tidybot2.github.io/do
 
 ### Screen Regions
 ```
-┌────────────────────────────────┬────┐
-│                                │    │
-│      ARM CONTROL               │BASE│
-│      (left 90%)                │CTRL│
-│                                │(10%)│
-│  Touch + move phone =          │    │
-│  arm joint control             │    │
-│                                │    │
-│  Swipe up/down =               │    │
-│  gripper open/close            │    │
-└────────────────────────────────┴────┘
+┌────────────────────────────────┬──────┐
+│                                │      │
+│      (left 90%)                │ CTRL │
+│                                │ (10%)│
+│  Touch + move phone =          │      │
+│  arm joint control             │      │
+│                                │      │
+│  Swipe up/down =               │      │
+│  gripper open/close            │      │
+└────────────────────────────────┴──────┘
 ```
 
 ### Base Control (Touch Right 10% of Screen)
