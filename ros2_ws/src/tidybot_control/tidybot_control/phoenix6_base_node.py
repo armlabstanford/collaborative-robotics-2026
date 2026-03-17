@@ -285,13 +285,30 @@ class Phoenix6BaseNode(Node):
             self.vehicle.set_target_velocity(velocity, frame='local')
 
     def publish_callback(self):
-        """Publish odometry and TF."""
+        """Publish odometry and TF.
+
+        The Vehicle's world frame has forward = +X at theta=0, but the URDF
+        base_link frame has forward = -Y (+x=left, +y=backward).  We rotate
+        the published position by -pi/2 so that the odom frame is consistent
+        with the URDF base_link convention:
+
+            odom_x =  vehicle_y    (vehicle left  -> URDF +x = left)
+            odom_y = -vehicle_x    (vehicle fwd   -> URDF -y = forward)
+            odom_yaw = vehicle_th  (no offset — base_link co-oriented with odom at startup)
+        """
         now = self.get_clock().now().to_msg()
 
         with self.lock:
-            # Get state from vehicle
-            x, y, th = self.vehicle.x[0], self.vehicle.x[1], self.vehicle.x[2]
-            vx, vy, vth = self.vehicle.dx[0], self.vehicle.dx[1], self.vehicle.dx[2]
+            # Get state from vehicle (vehicle world frame)
+            veh_x, veh_y, veh_th = self.vehicle.x[0], self.vehicle.x[1], self.vehicle.x[2]
+            veh_vx, veh_vy, veh_vth = self.vehicle.dx[0], self.vehicle.dx[1], self.vehicle.dx[2]
+
+        # Rotate vehicle world -> URDF-compatible odom (rotate points by -pi/2)
+        # Old (uncorrected) values:
+        # x, y, th = veh_x, veh_y, veh_th
+        odom_x = veh_y
+        odom_y = -veh_x
+        odom_th = veh_th
 
         # Publish odometry
         odom = Odometry()
@@ -299,21 +316,22 @@ class Phoenix6BaseNode(Node):
         odom.header.frame_id = 'odom'
         odom.child_frame_id = 'base_link'
 
-        odom.pose.pose.position.x = x
-        odom.pose.pose.position.y = y
+        odom.pose.pose.position.x = odom_x
+        odom.pose.pose.position.y = odom_y
         odom.pose.pose.position.z = 0.0
 
         # Convert yaw to quaternion
-        cy = math.cos(th * 0.5)
-        sy = math.sin(th * 0.5)
+        cy = math.cos(odom_th * 0.5)
+        sy = math.sin(odom_th * 0.5)
         odom.pose.pose.orientation.x = 0.0
         odom.pose.pose.orientation.y = 0.0
         odom.pose.pose.orientation.z = sy
         odom.pose.pose.orientation.w = cy
 
-        odom.twist.twist.linear.x = vx
-        odom.twist.twist.linear.y = vy
-        odom.twist.twist.angular.z = vth
+        # Twist stays in body frame (unchanged)
+        odom.twist.twist.linear.x = veh_vx
+        odom.twist.twist.linear.y = veh_vy
+        odom.twist.twist.angular.z = veh_vth
 
         self.odom_pub.publish(odom)
 
@@ -322,8 +340,8 @@ class Phoenix6BaseNode(Node):
         t.header.stamp = now
         t.header.frame_id = 'odom'
         t.child_frame_id = 'base_link'
-        t.transform.translation.x = x
-        t.transform.translation.y = y
+        t.transform.translation.x = odom_x
+        t.transform.translation.y = odom_y
         t.transform.translation.z = 0.0
         t.transform.rotation.x = 0.0
         t.transform.rotation.y = 0.0

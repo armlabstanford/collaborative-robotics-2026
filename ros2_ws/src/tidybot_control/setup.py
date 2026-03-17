@@ -30,6 +30,7 @@ setup(
             'dynamixel_bus_node = tidybot_control.dynamixel_bus_node:main',
             'gripper_wrapper_node = tidybot_control.gripper_wrapper_node:main',
             'microphone_node = tidybot_control.microphone_node:main',
+            'phone_teleop_server = tidybot_control.phone_teleop_server:main',
         ],
     },
 )
