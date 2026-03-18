@@ -18,12 +18,13 @@ Control Mapping (same as upstream):
         - Tilt left/right (roll about Y)    → robot strafe left/right
         - Rotate flat about Z (yaw)         → robot rotation in place
 
-    Arm: Cartesian end-effector control via IK (pinocchio)
-        - Phone position → end-effector position (like holding the EE)
-        - Phone rotation → end-effector rotation
-        - All joints solved via damped least-squares IK
+    Arm: Tilt + translation control via IK (pinocchio)
+        - Phone XY translation → EE position (scaled to 70%)
+        - Phone tilt about X (fwd/back) → wrist angle velocity (in/out bend)
+        - Phone tilt about Y (left/right) → wrist rotate velocity (CW/CCW)
+        - IK solves all joints; tilt integrates into EE orientation target
         - Velocity limiting prevents jerky motion
-        - Releasing touch stops arm movement
+        - Unreachable targets hold arm at last valid position
 
 Usage:
     # Install web dependencies
@@ -88,6 +89,11 @@ BASE_MAX_LINEAR_VEL = 0.5        # m/s cap
 BASE_MAX_ANGULAR_VEL = 1.0       # rad/s cap
 BASE_MAX_TILT_ANGLE = math.pi / 4  # 45 deg tilt = full speed
 BASE_TILT_DEADZONE = 0.05        # radians (~3 deg) — ignore small tilts
+
+# Arm control parameters
+ARM_TRANSLATION_SCALE = 0.7      # 70% of phone displacement → EE displacement
+ARM_MAX_WRIST_VEL = 1.5          # rad/s max EE orientation change from tilt
+ARM_IK_POS_TOL = 0.05            # meters — reject IK solution if position error exceeds this
 
 # WebXR coordinate conversion
 DEVICE_CAMERA_OFFSET = np.array([0.0, 0.02, -0.04])
@@ -304,152 +310,225 @@ class ArmIKController:
 # Teleop Controller (WebXR base + cartesian arm)
 # ---------------------------------------------------------------------------
 
+def _tilt_to_vel(angle, deadzone, max_angle, max_vel):
+    """Map a tilt angle to a velocity with deadzone and clamping."""
+    if abs(angle) < deadzone:
+        return 0.0
+    frac = np.clip(angle / max_angle, -1.0, 1.0)
+    return frac * max_vel
+
+
 class TeleopController:
-    """Processes WebXR messages and computes base velocity + arm targets."""
+    """Processes WebXR messages and computes base velocity + arm targets.
+
+    Supports dual-phone bimanual control: each phone is auto-assigned to an
+    arm (right first, then left). Either phone can also do base control.
+    """
 
     def __init__(self, ik_controller):
         self.ik = ik_controller
 
-        # Device tracking
-        self.primary_device_id = None
-        self.secondary_device_id = None
+        # Device-to-arm mapping: {device_id: 'right'|'left'}
+        self.device_arm_map = {}
         self.enabled_counts = {}
 
-        # WebXR reference poses
-        self.base_xr_ref_rot_inv = None   # Inverse of phone orientation when base mode started
-        self.arm_xr_ref_pos = None
-        self.arm_xr_ref_rot_inv = None
+        # Per-arm teleop state
+        self.arm_state = {
+            'right': self._new_arm_state(),
+            'left': self._new_arm_state(),
+        }
 
-        # Robot reference poses
-        self.arm_ref_ee_pos = None     # EE position at touch start
-        self.arm_ref_ee_rot = None     # EE rotation at touch start
-
-        # Base velocity output (set each frame, zeroed on release)
+        # Base control (shared — either phone can drive, latest wins)
+        self.base_xr_ref_rot_inv = {}   # {device_id: rot_inv}
         self.base_cmd_vel = np.array([0.0, 0.0, 0.0])  # [vx, vy, wz]
         self.base_control_active = False
+        self.base_control_device = None
 
-        # Arm IK output
-        self.arm_target_joints = None  # Target joint positions from IK
-        self.arm_control_active = False
-        self.gripper_delta = 0.0
+    @staticmethod
+    def _new_arm_state():
+        return {
+            'xr_ref_pos': None,
+            'xr_ref_rot_inv': None,
+            'ref_ee_pos': None,
+            'ref_ee_rot': None,
+            'current_target_rot': None,  # Evolving EE orientation (tilt-integrated)
+            'target_joints': None,
+            'control_active': False,
+            'gripper_delta': 0.0,
+        }
 
-    def process_message(self, data, current_arm_positions, active_arm):
-        """Process a WebXR message. Updates base_cmd_vel and arm targets."""
+    def assign_device_to_arm(self, device_id, arm):
+        """Assign a device to a specific arm, clearing any conflicts."""
+        old_arm = self.device_arm_map.get(device_id)
+        if old_arm:
+            self.arm_state[old_arm] = self._new_arm_state()
+        # Swap: if another device has the target arm, give it our old arm
+        other_arm = 'left' if arm == 'right' else 'right'
+        for did, a in list(self.device_arm_map.items()):
+            if a == arm and did != device_id:
+                self.device_arm_map[did] = other_arm
+                self.arm_state[other_arm] = self._new_arm_state()
+        self.device_arm_map[device_id] = arm
+
+    def remove_device(self, device_id):
+        """Clean up all state for a disconnected device."""
+        arm = self.device_arm_map.pop(device_id, None)
+        if arm:
+            self.arm_state[arm] = self._new_arm_state()
+        self.enabled_counts.pop(device_id, None)
+        self.base_xr_ref_rot_inv.pop(device_id, None)
+        if self.base_control_device == device_id:
+            self.base_cmd_vel[:] = 0.0
+            self.base_control_active = False
+            self.base_control_device = None
+
+    def _auto_assign_device(self, device_id):
+        """Auto-assign device to first available arm (right, then left)."""
+        if device_id in self.device_arm_map:
+            return
+        assigned_arms = set(self.device_arm_map.values())
+        if 'right' not in assigned_arms:
+            self.device_arm_map[device_id] = 'right'
+        elif 'left' not in assigned_arms:
+            self.device_arm_map[device_id] = 'left'
+        # else: both arms taken, device won't get arm control
+
+    def process_message(self, data, arm_positions):
+        """Process a WebXR message from one device.
+
+        Args:
+            data: WebXR message dict with device_id, teleop_mode, position, orientation
+            arm_positions: {'right': [6 floats], 'left': [6 floats]}
+        """
         device_id = data.get('device_id', 'default')
 
-        # Update enabled count
+        # Update enabled count (frames with active touch)
         if 'teleop_mode' in data:
             self.enabled_counts[device_id] = self.enabled_counts.get(device_id, 0) + 1
         else:
             self.enabled_counts[device_id] = 0
 
-        # Assign devices (skip first 2 steps for WebXR pose latency)
+        # Auto-assign device to an arm after warmup frames
         if self.enabled_counts.get(device_id, 0) > 2:
-            if self.primary_device_id is None and device_id != self.secondary_device_id:
-                self.primary_device_id = device_id
-            elif self.secondary_device_id is None and device_id != self.primary_device_id:
-                self.secondary_device_id = device_id
+            self._auto_assign_device(device_id)
         elif self.enabled_counts.get(device_id, 0) == 0:
-            if device_id == self.primary_device_id:
-                self.primary_device_id = None
-                self.base_xr_ref_rot_inv = None
-                self.arm_xr_ref_pos = None
-                self.arm_control_active = False
-                # Zero velocity on release
+            # Touch released — reset arm XR refs but keep device-to-arm mapping
+            arm = self.device_arm_map.get(device_id)
+            if arm:
+                state = self.arm_state[arm]
+                state['xr_ref_pos'] = None
+                state['xr_ref_rot_inv'] = None
+                state['ref_ee_pos'] = None
+                state['ref_ee_rot'] = None
+                state['current_target_rot'] = None
+                state['control_active'] = False
+                state['gripper_delta'] = 0.0
+            # Reset base ref for this device
+            self.base_xr_ref_rot_inv.pop(device_id, None)
+            if self.base_control_device == device_id:
                 self.base_cmd_vel[:] = 0.0
                 self.base_control_active = False
-            elif device_id == self.secondary_device_id:
-                self.secondary_device_id = None
-                self.base_xr_ref_rot_inv = None
+                self.base_control_device = None
 
         # Process teleop commands
-        if self.primary_device_id is not None and 'teleop_mode' in data:
-            if 'position' not in data or 'orientation' not in data:
-                return
+        if 'teleop_mode' not in data:
+            return
+        if 'position' not in data or 'orientation' not in data:
+            return
 
-            pos, rot = convert_webxr_pose(data['position'], data['orientation'])
+        pos, rot = convert_webxr_pose(data['position'], data['orientation'])
 
-            # --- BASE CONTROL (tilt-based velocity) ---
-            # Phone flat = stop. Tilt forward/back about X → vx.
-            # Tilt left/right about Y → vy. Rotate about Z → wz.
-            # All scaled proportionally to tilt angle.
-            if data['teleop_mode'] == 'base' or device_id == self.secondary_device_id:
-                if self.base_xr_ref_rot_inv is None:
-                    # Capture reference orientation (phone flat = nominal)
-                    self.base_xr_ref_rot_inv = rot.inv()
+        # --- BASE CONTROL (tilt-based velocity) ---
+        if data['teleop_mode'] == 'base':
+            if device_id not in self.base_xr_ref_rot_inv:
+                self.base_xr_ref_rot_inv[device_id] = rot.inv()
 
-                # Relative rotation from reference
-                delta_rot = rot * self.base_xr_ref_rot_inv
-                # Decompose into tilt angles (robot frame: x=fwd, y=left, z=up)
-                # rx = roll about forward axis (lateral tilt)
-                # ry = pitch about left axis (forward/back tilt)
-                # rz = yaw about up axis (rotation)
-                rx, ry, rz = delta_rot.as_euler('xyz')
+            delta_rot = rot * self.base_xr_ref_rot_inv[device_id]
+            rx, ry, rz = delta_rot.as_euler('xyz')
 
-                def tilt_to_vel(angle, deadzone, max_angle, max_vel):
-                    if abs(angle) < deadzone:
-                        return 0.0
-                    frac = np.clip(angle / max_angle, -1.0, 1.0)
-                    return frac * max_vel
+            vx = _tilt_to_vel(ry, BASE_TILT_DEADZONE,
+                              BASE_MAX_TILT_ANGLE, BASE_MAX_LINEAR_VEL)
+            vy = _tilt_to_vel(-rx, BASE_TILT_DEADZONE,
+                              BASE_MAX_TILT_ANGLE, BASE_MAX_LINEAR_VEL)
+            wz = _tilt_to_vel(rz, BASE_TILT_DEADZONE,
+                              BASE_MAX_TILT_ANGLE, BASE_MAX_ANGULAR_VEL)
 
-                # Pitch (ry): tilt forward (+ry) → drive forward (+vx)
-                vx = tilt_to_vel(ry, BASE_TILT_DEADZONE,
-                                 BASE_MAX_TILT_ANGLE, BASE_MAX_LINEAR_VEL)
-                # Roll (rx): tilt right (-rx) → strafe right (-vy in robot frame)
-                vy = tilt_to_vel(-rx, BASE_TILT_DEADZONE,
-                                 BASE_MAX_TILT_ANGLE, BASE_MAX_LINEAR_VEL)
-                # Yaw (rz): rotate phone CCW (+rz) → robot rotates CCW (+wz)
-                wz = tilt_to_vel(rz, BASE_TILT_DEADZONE,
-                                 BASE_MAX_TILT_ANGLE, BASE_MAX_ANGULAR_VEL)
+            self.base_cmd_vel = np.array([vx, vy, wz])
+            self.base_control_active = True
+            self.base_control_device = device_id
 
-                self.base_cmd_vel = np.array([vx, vy, wz])
-                self.base_control_active = True
-                self.arm_control_active = False
+        # --- ARM CONTROL ---
+        # Phone XY translation → EE position (scaled to 70%)
+        # Phone tilt about X (fwd/back) → wrist angle (in/out bend), velocity-controlled
+        # Phone tilt about Y (left/right) → wrist rotate (CW/CCW top-down), velocity-controlled
+        # IK handles all joints for position; tilt integrates into EE orientation target
+        elif data['teleop_mode'] == 'arm':
+            arm = self.device_arm_map.get(device_id)
+            if arm is None:
+                return  # Device not assigned to any arm
 
-            # --- ARM CONTROL (Cartesian IK) ---
-            elif data['teleop_mode'] == 'arm':
-                self.base_control_active = False
+            state = self.arm_state[arm]
+            current_arm_positions = arm_positions[arm]
 
-                if self.arm_xr_ref_pos is None:
-                    # Capture reference: phone pose + current EE pose via FK
-                    self.arm_xr_ref_pos = pos.copy()
-                    self.arm_xr_ref_rot_inv = rot.inv()
+            if state['xr_ref_pos'] is None:
+                state['xr_ref_pos'] = pos.copy()
+                state['xr_ref_rot_inv'] = rot.inv()
 
-                    if self.ik.available:
-                        ee_pos, ee_rot = self.ik.forward_kinematics(
-                            active_arm, np.array(current_arm_positions))
-                        if ee_pos is not None:
-                            self.arm_ref_ee_pos = ee_pos.copy()
-                            self.arm_ref_ee_rot = ee_rot.copy()
+                if self.ik.available:
+                    ee_pos, ee_rot = self.ik.forward_kinematics(
+                        arm, np.array(current_arm_positions))
+                    if ee_pos is not None:
+                        state['ref_ee_pos'] = ee_pos.copy()
+                        state['ref_ee_rot'] = ee_rot.copy()
+                        state['current_target_rot'] = ee_rot.copy()
 
-                if self.arm_ref_ee_pos is not None and self.ik.available:
-                    # Compute phone delta from reference
-                    delta_pos = pos - self.arm_xr_ref_pos
-                    delta_rot = (rot * self.arm_xr_ref_rot_inv)
+            if state['ref_ee_pos'] is not None and self.ik.available:
+                # Position: phone XY translation → EE XY (keep Z at reference)
+                delta_pos = pos - state['xr_ref_pos']
+                target_ee_pos = state['ref_ee_pos'].copy()
+                target_ee_pos[0] += delta_pos[0] * ARM_TRANSLATION_SCALE
+                target_ee_pos[1] += delta_pos[1] * ARM_TRANSLATION_SCALE
 
-                    # Target EE = reference EE + phone delta
-                    target_ee_pos = self.arm_ref_ee_pos + delta_pos
-                    target_ee_rot = delta_rot.as_matrix() @ self.arm_ref_ee_rot
+                # Orientation: phone tilt → wrist velocity (integrated each frame)
+                phone_delta_rot = rot * state['xr_ref_rot_inv']
+                rx, ry, rz = phone_delta_rot.as_euler('xyz')
+                dt = 1.0 / CONTROL_RATE
 
-                    # Solve IK
-                    success, joints = self.ik.solve_ik(
-                        active_arm,
-                        target_ee_pos, target_ee_rot,
-                        seed=np.array(current_arm_positions),
-                        max_iter=30, dt=0.3, damping=1e-5)
+                # ry (forward/back tilt) → wrist angle change (in/out bend)
+                omega_pitch = _tilt_to_vel(ry, BASE_TILT_DEADZONE,
+                                           BASE_MAX_TILT_ANGLE, ARM_MAX_WRIST_VEL)
+                # rx (left/right tilt) → wrist rotate change (CW/CCW top-down)
+                omega_yaw = _tilt_to_vel(-rx, BASE_TILT_DEADZONE,
+                                         BASE_MAX_TILT_ANGLE, ARM_MAX_WRIST_VEL)
 
-                    if success:
-                        self.arm_target_joints = joints
-                        self.arm_control_active = True
+                # Save previous orientation in case IK fails (revert to stay reachable)
+                prev_target_rot = state['current_target_rot'].copy()
 
-                # Gripper from vertical swipe
-                self.gripper_delta = data.get('gripper_delta', 0.0)
+                # Integrate: apply small rotation in robot frame
+                d_rot = R.from_rotvec([0, omega_pitch * dt, omega_yaw * dt])
+                state['current_target_rot'] = d_rot.as_matrix() @ state['current_target_rot']
 
-        # Teleop disabled — zero everything
-        elif self.primary_device_id is None:
-            self.base_cmd_vel[:] = 0.0
-            self.base_control_active = False
-            self.arm_control_active = False
+                # Solve IK for position + tilt-integrated orientation
+                success, joints = self.ik.solve_ik(
+                    arm,
+                    target_ee_pos, state['current_target_rot'],
+                    seed=np.array(current_arm_positions),
+                    max_iter=30, dt=0.3, damping=1e-5)
+
+                if success:
+                    # Verify IK solution actually reaches the target position
+                    solved_pos, _ = self.ik.forward_kinematics(arm, joints)
+                    if (solved_pos is not None and
+                            np.linalg.norm(solved_pos - target_ee_pos) < ARM_IK_POS_TOL):
+                        state['target_joints'] = joints
+                        state['control_active'] = True
+                    else:
+                        # Unreachable — revert orientation so it doesn't drift
+                        state['current_target_rot'] = prev_target_rot
+                else:
+                    state['current_target_rot'] = prev_target_rot
+
+            state['gripper_delta'] = data.get('gripper_delta', 0.0)
 
 
 class PhoneTeleopNode(Node):
@@ -481,12 +560,13 @@ class PhoneTeleopNode(Node):
         # Teleop controller
         self.teleop = TeleopController(self.ik)
 
-        # Message queue from Socket.IO
-        self.msg_queue = queue.Queue(maxsize=100)
+        # Per-device message queues from Socket.IO
+        self.msg_queues = {}            # {device_id: Queue}
+        self.msg_queues_lock = threading.Lock()
+        self.sid_device_map = {}        # SocketIO sid → device_id
 
         # Shared state
         self.lock = threading.Lock()
-        self.active_arm = 'right'
         self.gripper_state = {'right': 0.0, 'left': 0.0}
 
         # Velocity-limited arm state
@@ -495,7 +575,7 @@ class PhoneTeleopNode(Node):
         # Control timer
         self.control_timer = self.create_timer(1.0 / CONTROL_RATE, self._control_loop)
 
-        self.get_logger().info('PhoneTeleopNode initialized (WebXR + Cartesian IK)')
+        self.get_logger().info('PhoneTeleopNode initialized (dual-phone bimanual teleop)')
 
     def _right_js_cb(self, msg):
         if len(msg.position) >= 6:
@@ -506,96 +586,97 @@ class PhoneTeleopNode(Node):
             self.left_arm_positions = list(msg.position[:6])
 
     def _control_loop(self):
-        """Process messages and publish velocity-limited commands."""
+        """Process messages and publish velocity-limited commands for both arms."""
         dt = 1.0 / CONTROL_RATE
 
-        with self.lock:
-            active_arm = self.active_arm
+        arm_positions = {
+            'right': list(self.right_arm_positions),
+            'left': list(self.left_arm_positions),
+        }
 
-        # Get current arm positions
-        if active_arm == 'right':
-            current_positions = list(self.right_arm_positions)
-        else:
-            current_positions = list(self.left_arm_positions)
+        # Drain all per-device queues → latest non-stale message per device
+        latest_per_device = {}
+        with self.msg_queues_lock:
+            device_ids = list(self.msg_queues.keys())
+        for device_id in device_ids:
+            with self.msg_queues_lock:
+                q = self.msg_queues.get(device_id)
+            if q is None:
+                continue
+            latest = None
+            while not q.empty():
+                try:
+                    data = q.get_nowait()
+                    if 'timestamp' in data:
+                        age_ms = time.time() * 1000 - data['timestamp']
+                        if age_ms > MESSAGE_TIMEOUT_MS:
+                            continue
+                    latest = data
+                except queue.Empty:
+                    break
+            if latest is not None:
+                latest_per_device[device_id] = latest
 
-        # Drain message queue
-        latest_data = None
-        while not self.msg_queue.empty():
-            try:
-                data = self.msg_queue.get_nowait()
-                if 'timestamp' in data:
-                    age_ms = time.time() * 1000 - data['timestamp']
-                    if age_ms > MESSAGE_TIMEOUT_MS:
-                        continue
-                latest_data = data
-            except queue.Empty:
-                break
+        # Process each device's latest message
+        for device_id, data in latest_per_device.items():
+            self.teleop.process_message(data, arm_positions)
 
-        if latest_data is not None:
-            self.teleop.process_message(
-                latest_data, current_positions, active_arm)
-
-        # --- Base: publish cmd_vel (always, so zero gets sent on release) ---
+        # --- Base: publish cmd_vel ---
         twist = Twist()
         if self.teleop.base_control_active:
             twist.linear.x = float(self.teleop.base_cmd_vel[0])
             twist.linear.y = float(self.teleop.base_cmd_vel[1])
             twist.angular.z = float(self.teleop.base_cmd_vel[2])
-        # else: twist stays all zeros → robot stops
         self.cmd_vel_pub.publish(twist)
 
-        # --- Arm: velocity-limited interpolation toward IK target ---
-        if self.teleop.arm_control_active and self.teleop.arm_target_joints is not None:
-            target = self.teleop.arm_target_joints
+        # --- Both arms: velocity-limited interpolation toward IK targets ---
+        limits = list(JOINT_LIMITS.values())
+        for arm in ['right', 'left']:
+            state = self.teleop.arm_state[arm]
+            if state['control_active'] and state['target_joints'] is not None:
+                target = state['target_joints']
 
-            # Initialize command positions from current if needed
-            if self.current_cmd_positions[active_arm] is None:
-                self.current_cmd_positions[active_arm] = np.array(current_positions)
+                if self.current_cmd_positions[arm] is None:
+                    self.current_cmd_positions[arm] = np.array(arm_positions[arm])
 
-            cmd = self.current_cmd_positions[active_arm].copy()
+                cmd = self.current_cmd_positions[arm].copy()
+                for i in range(6):
+                    diff = target[i] - cmd[i]
+                    max_step = MAX_JOINT_VELOCITY * dt
+                    if abs(diff) > max_step:
+                        diff = math.copysign(max_step, diff)
+                    cmd[i] += diff
+                    lo, hi = limits[i]
+                    cmd[i] = max(lo, min(hi, cmd[i]))
+                self.current_cmd_positions[arm] = cmd
 
-            # Velocity-limited step toward target
-            for i in range(6):
-                diff = target[i] - cmd[i]
-                max_step = MAX_JOINT_VELOCITY * dt
-                if abs(diff) > max_step:
-                    diff = math.copysign(max_step, diff)
-                cmd[i] += diff
-                # Clamp to joint limits
-                lo, hi = list(JOINT_LIMITS.values())[i]
-                cmd[i] = max(lo, min(hi, cmd[i]))
+                msg = Float64MultiArray()
+                msg.data = cmd.tolist()
+                if arm == 'right':
+                    self.right_arm_pub.publish(msg)
+                else:
+                    self.left_arm_pub.publish(msg)
 
-            self.current_cmd_positions[active_arm] = cmd
-
-            # Publish
-            msg = Float64MultiArray()
-            msg.data = cmd.tolist()
-            if active_arm == 'right':
-                self.right_arm_pub.publish(msg)
+                # Gripper from vertical swipe
+                gripper_delta = state['gripper_delta']
+                if abs(gripper_delta) > 0.3:
+                    new_state = 1.0 if gripper_delta < -0.3 else 0.0
+                    with self.lock:
+                        if self.gripper_state[arm] != new_state:
+                            self.gripper_state[arm] = new_state
+                            grip_msg = Float64MultiArray()
+                            grip_msg.data = [new_state]
+                            if arm == 'right':
+                                self.right_gripper_pub.publish(grip_msg)
+                            else:
+                                self.left_gripper_pub.publish(grip_msg)
             else:
-                self.left_arm_pub.publish(msg)
+                self.current_cmd_positions[arm] = None
 
-            # Gripper from vertical swipe
-            gripper_delta = self.teleop.gripper_delta
-            if abs(gripper_delta) > 0.3:
-                new_state = 1.0 if gripper_delta < -0.3 else 0.0
-                with self.lock:
-                    if self.gripper_state[active_arm] != new_state:
-                        self.gripper_state[active_arm] = new_state
-                        grip_msg = Float64MultiArray()
-                        grip_msg.data = [new_state]
-                        if active_arm == 'right':
-                            self.right_gripper_pub.publish(grip_msg)
-                        else:
-                            self.left_gripper_pub.publish(grip_msg)
-        else:
-            # Not controlling — reset command tracker so next touch starts fresh
-            self.current_cmd_positions[active_arm] = None
-
-    def set_active_arm(self, arm):
+    def assign_device_to_arm(self, device_id, arm):
         with self.lock:
-            self.active_arm = arm
-        self.get_logger().info(f'Active arm -> {arm}')
+            self.teleop.assign_device_to_arm(device_id, arm)
+        self.get_logger().info(f'Device {device_id[:8]}... -> {arm} arm')
 
     def toggle_gripper(self, side):
         with self.lock:
@@ -620,12 +701,14 @@ class PhoneTeleopNode(Node):
         self.get_logger().info(f'Sent {arm} arm to preset pose')
 
     def emergency_stop(self):
-        self.teleop.arm_control_active = False
-        self.teleop.base_control_active = False
+        for arm in ['right', 'left']:
+            self.teleop.arm_state[arm] = self.teleop._new_arm_state()
         self.teleop.base_cmd_vel[:] = 0.0
-        self.teleop.primary_device_id = None
-        self.teleop.base_xr_ref_rot_inv = None
-        self.teleop.arm_xr_ref_pos = None
+        self.teleop.base_control_active = False
+        self.teleop.base_control_device = None
+        self.teleop.device_arm_map.clear()
+        self.teleop.base_xr_ref_rot_inv.clear()
+        self.teleop.enabled_counts.clear()
         self.current_cmd_positions = {'right': None, 'left': None}
         twist = Twist()
         self.cmd_vel_pub.publish(twist)
@@ -657,8 +740,16 @@ def create_flask_app(ros_node: PhoneTeleopNode):
 
     @socketio.on('disconnect')
     def handle_disconnect():
-        ros_node.emergency_stop()
-        ros_node.get_logger().info('Phone disconnected')
+        from flask import request
+        sid = request.sid
+        device_id = ros_node.sid_device_map.pop(sid, None)
+        if device_id:
+            ros_node.teleop.remove_device(device_id)
+            with ros_node.msg_queues_lock:
+                ros_node.msg_queues.pop(device_id, None)
+            ros_node.get_logger().info(f'Phone disconnected (device {device_id[:8]}...)')
+        else:
+            ros_node.get_logger().info('Phone disconnected (unknown device)')
 
     @socketio.on('message')
     def handle_message(data):
@@ -667,22 +758,52 @@ def create_flask_app(ros_node: PhoneTeleopNode):
         if 'state_update' in data:
             ros_node.get_logger().info(f'State: {data["state_update"]}')
             return
+        device_id = data.get('device_id', 'default')
+        # Track SocketIO sid → device_id for disconnect cleanup
+        from flask import request
+        ros_node.sid_device_map[request.sid] = device_id
+        # Route to per-device queue
+        with ros_node.msg_queues_lock:
+            if device_id not in ros_node.msg_queues:
+                ros_node.msg_queues[device_id] = queue.Queue(maxsize=20)
         try:
-            ros_node.msg_queue.put_nowait(data)
+            ros_node.msg_queues[device_id].put_nowait(data)
         except queue.Full:
             pass
 
     @socketio.on('set_arm')
     def handle_set_arm(data):
-        ros_node.set_active_arm(data.get('arm', 'right'))
+        device_id = data.get('device_id', 'default')
+        arm = data.get('arm', 'right')
+        ros_node.assign_device_to_arm(device_id, arm)
+        # Broadcast assignment to all clients
+        socketio.emit('arm_assignment', {
+            'device_id': device_id,
+            'arm': arm,
+            'all_assignments': dict(ros_node.teleop.device_arm_map),
+        })
+
+    @socketio.on('request_assignment')
+    def handle_request_assignment(data):
+        device_id = data.get('device_id', 'default')
+        arm = ros_node.teleop.device_arm_map.get(device_id)
+        emit('arm_assignment', {
+            'device_id': device_id,
+            'arm': arm,
+            'all_assignments': dict(ros_node.teleop.device_arm_map),
+        })
 
     @socketio.on('toggle_gripper')
     def handle_toggle_gripper(data):
-        ros_node.toggle_gripper(data.get('side', ros_node.active_arm))
+        device_id = data.get('device_id', 'default')
+        default_arm = ros_node.teleop.device_arm_map.get(device_id, 'right')
+        ros_node.toggle_gripper(data.get('side', default_arm))
 
     @socketio.on('preset_pose')
     def handle_preset_pose(data):
-        arm = data.get('arm', ros_node.active_arm)
+        device_id = data.get('device_id', 'default')
+        default_arm = ros_node.teleop.device_arm_map.get(device_id, 'right')
+        arm = data.get('arm', default_arm)
         pose_name = data.get('pose', 'sleep')
         pose = SLEEP_POSE if pose_name == 'sleep' else HOME_POSE
         ros_node.send_arm_to_pose(arm, pose)
@@ -935,8 +1056,8 @@ WEBXR_HTML = r"""<!doctype html>
   <div id="overlay">
     <header></header>
     <div id="arm-controls">
-      <span style="font-weight:700; font-size:11px; white-space:nowrap;">Arm:</span>
-      <button class="active" id="btn-right" onclick="selectArm('right')">Right</button>
+      <span id="arm-label" style="font-weight:700; font-size:11px; color:#e67e22; white-space:nowrap;">Not assigned</span>
+      <button id="btn-right" onclick="selectArm('right')">Right</button>
       <button id="btn-left" onclick="selectArm('left')">Left</button>
       <button class="grip-btn" id="grip-btn" onclick="toggleGripper()">Gripper: OPEN</button>
       <button class="preset-btn" onclick="presetPose('home')">Home</button>
@@ -961,20 +1082,47 @@ WEBXR_HTML = r"""<!doctype html>
     const socket = io();
     socket.on('echo', (ts) => { document.getElementById('info').innerText = rttStats.calculate(Date.now()-ts); });
 
-    let activeArm = 'right';
+    // Per-phone arm assignment (set by server)
+    let myArm = null;
+
+    socket.on('connect', () => {
+      socket.emit('request_assignment', {device_id: deviceId});
+    });
+
+    socket.on('arm_assignment', (data) => {
+      const assignments = data.all_assignments || {};
+      if (assignments[deviceId] !== undefined) {
+        myArm = assignments[deviceId];
+      } else if (data.device_id === deviceId) {
+        myArm = data.arm;
+      }
+      updateArmUI();
+    });
+
+    function updateArmUI() {
+      const label = document.getElementById('arm-label');
+      if (myArm) {
+        label.textContent = 'My arm: ' + myArm.toUpperCase();
+        label.style.color = myArm === 'right' ? '#4a90d9' : '#27ae60';
+      } else {
+        label.textContent = 'Not assigned';
+        label.style.color = '#e67e22';
+      }
+      document.getElementById('btn-right').classList.toggle('active', myArm === 'right');
+      document.getElementById('btn-left').classList.toggle('active', myArm === 'left');
+    }
+
     function selectArm(arm) {
-      activeArm = arm; socket.emit('set_arm', {arm});
-      document.getElementById('btn-right').classList.toggle('active', arm==='right');
-      document.getElementById('btn-left').classList.toggle('active', arm==='left');
+      socket.emit('set_arm', {arm, device_id: deviceId});
     }
     let gripperOpen = true;
     function toggleGripper() {
-      socket.emit('toggle_gripper', {side: activeArm}); gripperOpen = !gripperOpen;
+      socket.emit('toggle_gripper', {side: myArm, device_id: deviceId}); gripperOpen = !gripperOpen;
       const btn = document.getElementById('grip-btn');
       btn.textContent = gripperOpen ? 'Gripper: OPEN' : 'Gripper: CLOSED';
       btn.classList.toggle('closed', !gripperOpen);
     }
-    function presetPose(name) { socket.emit('preset_pose', {arm: activeArm, pose: name}); }
+    function presetPose(name) { socket.emit('preset_pose', {arm: myArm, pose: name, device_id: deviceId}); }
     function emergencyStop() { socket.emit('emergency_stop'); }
   </script>
   <script type="module">
