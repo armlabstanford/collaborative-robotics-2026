@@ -1,0 +1,8 @@
+open3d>=0.18.0
+pyzmq>=25.0
+msgpack>=1.0
+numpy<2
+lz4>=4.0
+opencv-python>=4.0
+viser>=0.2.0
+trimesh>=4.0
