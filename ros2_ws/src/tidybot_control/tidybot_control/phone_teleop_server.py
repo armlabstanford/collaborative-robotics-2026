@@ -1026,6 +1026,7 @@ WEBXR_HTML = r"""<!doctype html>
   <title>TidyBot2 Phone Teleop</title>
   <style>
     body {
+      margin: 0; padding: 0;
       background-color: #F0F0F0;
       font: 1rem/1.4 -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen,
         Ubuntu, Cantarell, Fira Sans, Droid Sans, Helvetica Neue, sans-serif;
@@ -1033,7 +1034,7 @@ WEBXR_HTML = r"""<!doctype html>
     header { padding: 0.5em; background-color: rgba(255,255,255,0.90); }
     #info { font-size: 1.25em; background-color: rgba(240,240,240,0.5); }
     #arm-controls { padding: 0.4em; background-color: rgba(255,255,255,0.85); }
-    #arm-controls { display: flex; flex-wrap: nowrap; align-items: center; gap: 3px; }
+    #arm-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; }
     #arm-controls button {
       padding: 5px 8px; border-radius: 5px;
       border: 2px solid #333; background: #fff; font-size: 11px;

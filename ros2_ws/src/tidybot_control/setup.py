@@ -31,6 +31,8 @@ setup(
             'gripper_wrapper_node = tidybot_control.gripper_wrapper_node:main',
             'microphone_node = tidybot_control.microphone_node:main',
             'phone_teleop_server = tidybot_control.phone_teleop_server:main',
+            'pointcloud_node = tidybot_control.pointcloud_node:main',
+            'zmq_bridge_node = tidybot_control.zmq_bridge_node:main',
         ],
     },
 )
