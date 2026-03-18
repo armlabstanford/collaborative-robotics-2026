@@ -13,9 +13,10 @@ Control Mapping (same as upstream):
     Touch right 10% of screen → Base control mode
     Vertical swipe (arm mode) → Gripper open/close
 
-    Base: Phone physical movement in space maps to robot base pose target
-        - Phone XY translation → robot XY translation
-        - Phone yaw rotation   → robot theta rotation
+    Base: Phone tilt maps to robot base velocity (proportional speed control)
+        - Tilt forward/back (pitch about X) → robot forward/backward
+        - Tilt left/right (roll about Y)    → robot strafe left/right
+        - Rotate flat about Z (yaw)         → robot rotation in place
 
     Arm: Cartesian end-effector control via IK (pinocchio)
         - Phone position → end-effector position (like holding the EE)
@@ -82,12 +83,11 @@ CONTROL_RATE = 20                # Hz
 MAX_JOINT_VELOCITY = 0.5         # rad/s per joint (velocity limit)
 MESSAGE_TIMEOUT_MS = 250         # Ignore stale WebXR messages
 
-# Base velocity control parameters
-BASE_LINEAR_GAIN = 3.0           # m/s per meter of phone displacement
-BASE_ANGULAR_GAIN = 2.0          # rad/s per radian of phone yaw
+# Base velocity control parameters (tilt-based)
 BASE_MAX_LINEAR_VEL = 0.5        # m/s cap
 BASE_MAX_ANGULAR_VEL = 1.0       # rad/s cap
-BASE_DEADZONE = 0.01             # meters — ignore phone displacement smaller than this
+BASE_MAX_TILT_ANGLE = math.pi / 4  # 45 deg tilt = full speed
+BASE_TILT_DEADZONE = 0.05        # radians (~3 deg) — ignore small tilts
 
 # WebXR coordinate conversion
 DEVICE_CAMERA_OFFSET = np.array([0.0, 0.02, -0.04])
@@ -316,8 +316,7 @@ class TeleopController:
         self.enabled_counts = {}
 
         # WebXR reference poses
-        self.base_xr_ref_pos = None
-        self.base_xr_ref_yaw = None
+        self.base_xr_ref_rot_inv = None   # Inverse of phone orientation when base mode started
         self.arm_xr_ref_pos = None
         self.arm_xr_ref_rot_inv = None
 
@@ -353,7 +352,7 @@ class TeleopController:
         elif self.enabled_counts.get(device_id, 0) == 0:
             if device_id == self.primary_device_id:
                 self.primary_device_id = None
-                self.base_xr_ref_pos = None
+                self.base_xr_ref_rot_inv = None
                 self.arm_xr_ref_pos = None
                 self.arm_control_active = False
                 # Zero velocity on release
@@ -361,7 +360,7 @@ class TeleopController:
                 self.base_control_active = False
             elif device_id == self.secondary_device_id:
                 self.secondary_device_id = None
-                self.base_xr_ref_pos = None
+                self.base_xr_ref_rot_inv = None
 
         # Process teleop commands
         if self.primary_device_id is not None and 'teleop_mode' in data:
@@ -370,34 +369,38 @@ class TeleopController:
 
             pos, rot = convert_webxr_pose(data['position'], data['orientation'])
 
-            # --- BASE CONTROL (velocity from phone displacement) ---
+            # --- BASE CONTROL (tilt-based velocity) ---
+            # Phone flat = stop. Tilt forward/back about X → vx.
+            # Tilt left/right about Y → vy. Rotate about Z → wz.
+            # All scaled proportionally to tilt angle.
             if data['teleop_mode'] == 'base' or device_id == self.secondary_device_id:
-                if self.base_xr_ref_pos is None:
-                    # Capture reference: phone horizontal position + yaw
-                    self.base_xr_ref_pos = pos[:2].copy()  # XY only (horizontal)
-                    # Extract yaw from phone orientation
-                    euler = rot.as_euler('ZYX')  # [yaw, pitch, roll]
-                    self.base_xr_ref_yaw = euler[0]
+                if self.base_xr_ref_rot_inv is None:
+                    # Capture reference orientation (phone flat = nominal)
+                    self.base_xr_ref_rot_inv = rot.inv()
 
-                # Horizontal displacement from reference (XY plane only)
-                delta_xy = pos[:2] - self.base_xr_ref_pos
+                # Relative rotation from reference
+                delta_rot = rot * self.base_xr_ref_rot_inv
+                # Decompose into tilt angles (robot frame: x=fwd, y=left, z=up)
+                # rx = roll about forward axis (lateral tilt)
+                # ry = pitch about left axis (forward/back tilt)
+                # rz = yaw about up axis (rotation)
+                rx, ry, rz = delta_rot.as_euler('xyz')
 
-                # Apply deadzone
-                dist = np.linalg.norm(delta_xy)
-                if dist < BASE_DEADZONE:
-                    delta_xy = np.array([0.0, 0.0])
+                def tilt_to_vel(angle, deadzone, max_angle, max_vel):
+                    if abs(angle) < deadzone:
+                        return 0.0
+                    frac = np.clip(angle / max_angle, -1.0, 1.0)
+                    return frac * max_vel
 
-                # Scale displacement to velocity
-                vx = np.clip(delta_xy[0] * BASE_LINEAR_GAIN,
-                             -BASE_MAX_LINEAR_VEL, BASE_MAX_LINEAR_VEL)
-                vy = np.clip(delta_xy[1] * BASE_LINEAR_GAIN,
-                             -BASE_MAX_LINEAR_VEL, BASE_MAX_LINEAR_VEL)
-
-                # Yaw delta → angular velocity
-                euler = rot.as_euler('ZYX')
-                yaw_delta = (euler[0] - self.base_xr_ref_yaw + math.pi) % TWO_PI - math.pi
-                wz = np.clip(yaw_delta * BASE_ANGULAR_GAIN,
-                             -BASE_MAX_ANGULAR_VEL, BASE_MAX_ANGULAR_VEL)
+                # Pitch (ry): tilt forward (+ry) → drive forward (+vx)
+                vx = tilt_to_vel(ry, BASE_TILT_DEADZONE,
+                                 BASE_MAX_TILT_ANGLE, BASE_MAX_LINEAR_VEL)
+                # Roll (rx): tilt right (-rx) → strafe right (-vy in robot frame)
+                vy = tilt_to_vel(-rx, BASE_TILT_DEADZONE,
+                                 BASE_MAX_TILT_ANGLE, BASE_MAX_LINEAR_VEL)
+                # Yaw (rz): rotate phone CCW (+rz) → robot rotates CCW (+wz)
+                wz = tilt_to_vel(rz, BASE_TILT_DEADZONE,
+                                 BASE_MAX_TILT_ANGLE, BASE_MAX_ANGULAR_VEL)
 
                 self.base_cmd_vel = np.array([vx, vy, wz])
                 self.base_control_active = True
@@ -621,7 +624,7 @@ class PhoneTeleopNode(Node):
         self.teleop.base_control_active = False
         self.teleop.base_cmd_vel[:] = 0.0
         self.teleop.primary_device_id = None
-        self.teleop.base_xr_ref_pos = None
+        self.teleop.base_xr_ref_rot_inv = None
         self.teleop.arm_xr_ref_pos = None
         self.current_cmd_positions = {'right': None, 'left': None}
         twist = Twist()
