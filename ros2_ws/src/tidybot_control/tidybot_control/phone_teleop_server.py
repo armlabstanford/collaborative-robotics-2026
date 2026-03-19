@@ -18,11 +18,12 @@ Control Mapping (same as upstream):
         - Tilt left/right (roll about Y)    → robot strafe left/right
         - Rotate flat about Z (yaw)         → robot rotation in place
 
-    Arm: Tilt + translation control via IK (pinocchio)
-        - Phone XY translation → EE position (scaled to 70%)
-        - Phone tilt about X (fwd/back) → wrist angle velocity (in/out bend)
-        - Phone tilt about Y (left/right) → wrist rotate velocity (CW/CCW)
-        - IK solves all joints; tilt integrates into EE orientation target
+    Arm: Direct 1:1 phone-to-EE mapping via IK (pinocchio)
+        - Phone acts as physical proxy for the gripper
+        - Move phone → EE follows with matching displacement
+        - Rotate phone → EE follows with matching rotation
+        - IK solves all joints simultaneously for 6-DOF target
+        - Nullspace optimization biases toward rest pose to avoid singularity
         - Velocity limiting prevents jerky motion
         - Unreachable targets hold arm at last valid position
 
@@ -91,9 +92,11 @@ BASE_MAX_TILT_ANGLE = math.pi / 4  # 45 deg tilt = full speed
 BASE_TILT_DEADZONE = 0.05        # radians (~3 deg) — ignore small tilts
 
 # Arm control parameters
-ARM_TRANSLATION_SCALE = 0.7      # 70% of phone displacement → EE displacement
-ARM_MAX_WRIST_VEL = 1.5          # rad/s max EE orientation change from tilt
 ARM_IK_POS_TOL = 0.05            # meters — reject IK solution if position error exceeds this
+ARM_IK_MAX_STEP = math.radians(45)  # max joint angle change per IK iteration
+ARM_IK_NULLSPACE_GAIN = 0.5     # how strongly to bias toward rest pose
+# Rest pose for nullspace (retracted, away from singularity)
+REST_POSE = np.array([0.0, -0.5, 0.5, 0.0, 0.0, 0.0])
 
 # WebXR coordinate conversion
 DEVICE_CAMERA_OFFSET = np.array([0.0, 0.02, -0.04])
@@ -254,7 +257,12 @@ class ArmIKController:
                  other_arm=None, other_positions=None,
                  max_iter=50, dt=0.3, damping=1e-5,
                  pos_tol=0.01, ori_tol=0.1):
-        """Solve IK via damped least-squares.
+        """Solve IK via damped least-squares with nullspace optimization.
+
+        Nullspace projection biases redundant DOFs toward REST_POSE to
+        avoid singularities and keep the arm in a comfortable configuration.
+        Per-iteration joint step is clamped to ARM_IK_MAX_STEP.
+
         Returns (success, joint_positions[6]).
         """
         if not self.available or arm not in self.ee_frame_ids:
@@ -272,6 +280,7 @@ class ArmIKController:
                 jid = self.joint_ids[jname]
                 arm_idx_q.append(self.model.joints[jid].idx_q)
 
+        n_joints = len(arm_idx_q)
         limits = list(JOINT_LIMITS.values())
 
         for _ in range(max_iter):
@@ -292,9 +301,22 @@ class ArmIKController:
             JJT = J @ J.T + damping * np.eye(6)
 
             try:
-                v = J.T @ np.linalg.solve(JJT, error_vec)
+                Jinv = J.T @ np.linalg.solve(JJT, np.eye(6))
             except np.linalg.LinAlgError:
                 break
+
+            # Primary task: track target pose
+            v = Jinv @ error_vec
+
+            # Nullspace projection: bias toward rest pose
+            nullspace = np.eye(n_joints) - Jinv @ J
+            q_arm = np.array([q[idx] for idx in arm_idx_q])
+            v += ARM_IK_NULLSPACE_GAIN * nullspace @ (REST_POSE - q_arm)
+
+            # Clamp max step per iteration
+            max_abs = np.max(np.abs(v))
+            if max_abs > ARM_IK_MAX_STEP:
+                v *= ARM_IK_MAX_STEP / max_abs
 
             for i, idx_q in enumerate(arm_idx_q):
                 q[idx_q] = np.clip(q[idx_q] + dt * v[i], limits[i][0], limits[i][1])
@@ -351,7 +373,6 @@ class TeleopController:
             'xr_ref_rot_inv': None,
             'ref_ee_pos': None,
             'ref_ee_rot': None,
-            'current_target_rot': None,  # Evolving EE orientation (tilt-integrated)
             'target_joints': None,
             'control_active': False,
             'gripper_delta': 0.0,
@@ -420,7 +441,6 @@ class TeleopController:
                 state['xr_ref_rot_inv'] = None
                 state['ref_ee_pos'] = None
                 state['ref_ee_rot'] = None
-                state['current_target_rot'] = None
                 state['control_active'] = False
                 state['gripper_delta'] = 0.0
             # Reset base ref for this device
@@ -457,11 +477,8 @@ class TeleopController:
             self.base_control_active = True
             self.base_control_device = device_id
 
-        # --- ARM CONTROL ---
-        # Phone XY translation → EE position (scaled to 70%)
-        # Phone tilt about X (fwd/back) → wrist angle (in/out bend), velocity-controlled
-        # Phone tilt about Y (left/right) → wrist rotate (CW/CCW top-down), velocity-controlled
-        # IK handles all joints for position; tilt integrates into EE orientation target
+        # --- ARM CONTROL (1:1 phone-to-EE mapping) ---
+        # Phone displacement → EE displacement, phone rotation → EE rotation
         elif data['teleop_mode'] == 'arm':
             arm = self.device_arm_map.get(device_id)
             if arm is None:
@@ -470,6 +487,7 @@ class TeleopController:
             state = self.arm_state[arm]
             current_arm_positions = arm_positions[arm]
 
+            # On first touch: capture reference phone pose and current EE pose
             if state['xr_ref_pos'] is None:
                 state['xr_ref_pos'] = pos.copy()
                 state['xr_ref_rot_inv'] = rot.inv()
@@ -480,38 +498,20 @@ class TeleopController:
                     if ee_pos is not None:
                         state['ref_ee_pos'] = ee_pos.copy()
                         state['ref_ee_rot'] = ee_rot.copy()
-                        state['current_target_rot'] = ee_rot.copy()
 
             if state['ref_ee_pos'] is not None and self.ik.available:
-                # Position: phone XY translation → EE XY (keep Z at reference)
+                # Position: ref_ee + phone displacement
                 delta_pos = pos - state['xr_ref_pos']
-                target_ee_pos = state['ref_ee_pos'].copy()
-                target_ee_pos[0] += delta_pos[0] * ARM_TRANSLATION_SCALE
-                target_ee_pos[1] += delta_pos[1] * ARM_TRANSLATION_SCALE
+                target_ee_pos = state['ref_ee_pos'] + delta_pos
 
-                # Orientation: phone tilt → wrist velocity (integrated each frame)
-                phone_delta_rot = rot * state['xr_ref_rot_inv']
-                rx, ry, rz = phone_delta_rot.as_euler('xyz')
-                dt = 1.0 / CONTROL_RATE
+                # Orientation: relative phone rotation applied to ref EE orientation
+                delta_rot = rot * state['xr_ref_rot_inv']
+                target_ee_rot = delta_rot.as_matrix() @ state['ref_ee_rot']
 
-                # ry (forward/back tilt) → wrist angle change (in/out bend)
-                omega_pitch = _tilt_to_vel(ry, BASE_TILT_DEADZONE,
-                                           BASE_MAX_TILT_ANGLE, ARM_MAX_WRIST_VEL)
-                # rx (left/right tilt) → wrist rotate change (CW/CCW top-down)
-                omega_yaw = _tilt_to_vel(-rx, BASE_TILT_DEADZONE,
-                                         BASE_MAX_TILT_ANGLE, ARM_MAX_WRIST_VEL)
-
-                # Save previous orientation in case IK fails (revert to stay reachable)
-                prev_target_rot = state['current_target_rot'].copy()
-
-                # Integrate: apply small rotation in robot frame
-                d_rot = R.from_rotvec([0, omega_pitch * dt, omega_yaw * dt])
-                state['current_target_rot'] = d_rot.as_matrix() @ state['current_target_rot']
-
-                # Solve IK for position + tilt-integrated orientation
+                # Solve IK
                 success, joints = self.ik.solve_ik(
                     arm,
-                    target_ee_pos, state['current_target_rot'],
+                    target_ee_pos, target_ee_rot,
                     seed=np.array(current_arm_positions),
                     max_iter=30, dt=0.3, damping=1e-5)
 
@@ -522,11 +522,6 @@ class TeleopController:
                             np.linalg.norm(solved_pos - target_ee_pos) < ARM_IK_POS_TOL):
                         state['target_joints'] = joints
                         state['control_active'] = True
-                    else:
-                        # Unreachable — revert orientation so it doesn't drift
-                        state['current_target_rot'] = prev_target_rot
-                else:
-                    state['current_target_rot'] = prev_target_rot
 
             state['gripper_delta'] = data.get('gripper_delta', 0.0)
 
