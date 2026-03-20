@@ -43,15 +43,11 @@ Usage:
 """
 
 import math
-import os
 import queue
-import subprocess
 import threading
 import time
-from pathlib import Path
 
 import numpy as np
-import pinocchio as pin
 from scipy.spatial.transform import Rotation as R
 
 import rclpy
@@ -63,40 +59,22 @@ from std_msgs.msg import Float64MultiArray
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO, emit
 
+from tidybot_control.base_teleop import BaseTeleopController
+from tidybot_control.arm_teleop import (
+    ArmIKController, ArmTeleopController,
+    JOINT_LIMITS, JOINT_NAMES,
+)
+
 
 # --- Constants ---
 TWO_PI = 2.0 * math.pi
 SLEEP_POSE = [0.0, -1.80, 1.55, 0.0, 0.8, 0.0]
 HOME_POSE = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-# WX250s joint limits (radians)
-JOINT_LIMITS = {
-    'waist':        (-3.14, 3.14),
-    'shoulder':     (-1.88, 1.99),
-    'elbow':        (-2.15, 1.61),
-    'forearm_roll': (-3.14, 3.14),
-    'wrist_angle':  (-1.75, 2.15),
-    'wrist_rotate': (-3.14, 3.14),
-}
-JOINT_NAMES = list(JOINT_LIMITS.keys())
-
 # Control parameters
 CONTROL_RATE = 20                # Hz
 MAX_JOINT_VELOCITY = 0.5         # rad/s per joint (velocity limit)
 MESSAGE_TIMEOUT_MS = 250         # Ignore stale WebXR messages
-
-# Base velocity control parameters (tilt-based)
-BASE_MAX_LINEAR_VEL = 0.5        # m/s cap
-BASE_MAX_ANGULAR_VEL = 1.0       # rad/s cap
-BASE_MAX_TILT_ANGLE = math.pi / 4  # 45 deg tilt = full speed
-BASE_TILT_DEADZONE = 0.05        # radians (~3 deg) — ignore small tilts
-
-# Arm control parameters
-ARM_IK_POS_TOL = 0.05            # meters — reject IK solution if position error exceeds this
-ARM_IK_MAX_STEP = math.radians(45)  # max joint angle change per IK iteration
-ARM_IK_NULLSPACE_GAIN = 0.5     # how strongly to bias toward rest pose
-# Rest pose for nullspace (retracted, away from singularity)
-REST_POSE = np.array([0.0, -0.5, 0.5, 0.0, 0.0, 0.0])
 
 # WebXR coordinate conversion
 DEVICE_CAMERA_OFFSET = np.array([0.0, 0.02, -0.04])
@@ -114,231 +92,8 @@ def convert_webxr_pose(pos, quat):
 
 
 # ---------------------------------------------------------------------------
-# Arm IK Controller (pinocchio-based)
-# ---------------------------------------------------------------------------
-
-class ArmIKController:
-    """Lightweight pinocchio-based FK/IK for WX250s arm teleop.
-
-    Provides:
-    - Forward kinematics: joint positions → EE pose
-    - Inverse kinematics: target EE pose → joint positions (damped least-squares)
-    - Velocity-limited joint interpolation
-    """
-
-    ARM_JOINTS = {
-        'right': ['right_waist', 'right_shoulder', 'right_elbow',
-                  'right_forearm_roll', 'right_wrist_angle', 'right_wrist_rotate'],
-        'left': ['left_waist', 'left_shoulder', 'left_elbow',
-                 'left_forearm_roll', 'left_wrist_angle', 'left_wrist_rotate'],
-    }
-    EE_FRAMES = {'right': 'right_ee_arm_link', 'left': 'left_ee_arm_link'}
-
-    def __init__(self, logger):
-        self.logger = logger
-        self.model = None
-        self.data = None
-        self.joint_ids = {}
-        self.ee_frame_ids = {}
-        self._load_model()
-
-    def _load_model(self):
-        """Load pinocchio model from URDF."""
-        # Find URDF
-        urdf_path = Path(__file__).parent.parent.parent / \
-            'tidybot_description' / 'urdf' / 'tidybot_wx250s.urdf.xacro'
-        if not urdf_path.exists():
-            # Try installed share path
-            import ament_index_python
-            try:
-                pkg_path = ament_index_python.get_package_share_directory('tidybot_description')
-                urdf_path = Path(pkg_path) / 'urdf' / 'tidybot_wx250s.urdf.xacro'
-            except Exception:
-                pass
-
-        if not urdf_path.exists():
-            self.logger.error(f'URDF not found: {urdf_path}. Arm IK disabled.')
-            return
-
-        # Process xacro
-        try:
-            result = subprocess.run(
-                ['xacro', str(urdf_path)], capture_output=True, text=True, check=True)
-            urdf_string = result.stdout
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            self.logger.error(f'Xacro failed: {e}. Arm IK disabled.')
-            return
-
-        self.model = pin.buildModelFromXML(urdf_string)
-        self.data = self.model.createData()
-
-        # Map joint names to pinocchio IDs
-        for arm in ['right', 'left']:
-            for jname in self.ARM_JOINTS[arm]:
-                if self.model.existJointName(jname):
-                    self.joint_ids[jname] = self.model.getJointId(jname)
-
-        # Map EE frame names
-        for arm, frame_name in self.EE_FRAMES.items():
-            if self.model.existFrame(frame_name):
-                self.ee_frame_ids[arm] = self.model.getFrameId(frame_name)
-            else:
-                alt = f'{arm}_pinch_site'
-                if self.model.existFrame(alt):
-                    self.ee_frame_ids[arm] = self.model.getFrameId(alt)
-
-        self.logger.info(f'Pinocchio model loaded: {self.model.nq} DOF')
-
-    @property
-    def available(self):
-        return self.model is not None
-
-    def _set_arm_in_q(self, q, arm, positions):
-        """Set arm joint positions in full configuration vector."""
-        for i, jname in enumerate(self.ARM_JOINTS[arm]):
-            if jname in self.joint_ids:
-                jid = self.joint_ids[jname]
-                q[self.model.joints[jid].idx_q] = positions[i]
-
-    def _get_arm_from_q(self, q, arm):
-        """Extract arm joint positions from full configuration vector."""
-        positions = np.zeros(6)
-        for i, jname in enumerate(self.ARM_JOINTS[arm]):
-            if jname in self.joint_ids:
-                jid = self.joint_ids[jname]
-                positions[i] = q[self.model.joints[jid].idx_q]
-        return positions
-
-    def forward_kinematics(self, arm, joint_positions):
-        """Compute EE pose from joint positions.
-        Returns (position[3], rotation_matrix[3x3]) in base_link frame.
-        """
-        if not self.available or arm not in self.ee_frame_ids:
-            return None, None
-
-        q = pin.neutral(self.model)
-        self._set_arm_in_q(q, arm, joint_positions)
-        pin.forwardKinematics(self.model, self.data, q)
-        pin.updateFramePlacements(self.model, self.data)
-
-        ee_pose = self.data.oMf[self.ee_frame_ids[arm]]
-        return ee_pose.translation.copy(), ee_pose.rotation.copy()
-
-    def numerical_jacobian(self, q, arm, use_orientation=True, eps=1e-4):
-        """Compute numerical Jacobian for the arm."""
-        ee_frame_id = self.ee_frame_ids[arm]
-        arm_idx_q = []
-        for jname in self.ARM_JOINTS[arm]:
-            if jname in self.joint_ids:
-                jid = self.joint_ids[jname]
-                arm_idx_q.append(self.model.joints[jid].idx_q)
-
-        pin.forwardKinematics(self.model, self.data, q)
-        pin.updateFramePlacements(self.model, self.data)
-        pos0 = self.data.oMf[ee_frame_id].translation.copy()
-        R0 = self.data.oMf[ee_frame_id].rotation.copy() if use_orientation else None
-
-        rows = 6 if use_orientation else 3
-        J = np.zeros((rows, len(arm_idx_q)))
-        for i, idx_q in enumerate(arm_idx_q):
-            q_plus = q.copy()
-            q_plus[idx_q] += eps
-            pin.forwardKinematics(self.model, self.data, q_plus)
-            pin.updateFramePlacements(self.model, self.data)
-            pos_plus = self.data.oMf[ee_frame_id].translation.copy()
-            J[:3, i] = (pos_plus - pos0) / eps
-            if use_orientation:
-                R_plus = self.data.oMf[ee_frame_id].rotation.copy()
-                J[3:, i] = pin.log3(R0.T @ R_plus) / eps
-
-        return J
-
-    def solve_ik(self, arm, target_pos, target_rot, seed,
-                 other_arm=None, other_positions=None,
-                 max_iter=50, dt=0.3, damping=1e-5,
-                 pos_tol=0.01, ori_tol=0.1):
-        """Solve IK via damped least-squares with nullspace optimization.
-
-        Nullspace projection biases redundant DOFs toward REST_POSE to
-        avoid singularities and keep the arm in a comfortable configuration.
-        Per-iteration joint step is clamped to ARM_IK_MAX_STEP.
-
-        Returns (success, joint_positions[6]).
-        """
-        if not self.available or arm not in self.ee_frame_ids:
-            return False, seed
-
-        q = pin.neutral(self.model)
-        self._set_arm_in_q(q, arm, seed)
-        if other_arm and other_positions is not None:
-            self._set_arm_in_q(q, other_arm, other_positions)
-
-        ee_frame_id = self.ee_frame_ids[arm]
-        arm_idx_q = []
-        for jname in self.ARM_JOINTS[arm]:
-            if jname in self.joint_ids:
-                jid = self.joint_ids[jname]
-                arm_idx_q.append(self.model.joints[jid].idx_q)
-
-        n_joints = len(arm_idx_q)
-        limits = list(JOINT_LIMITS.values())
-
-        for _ in range(max_iter):
-            pin.forwardKinematics(self.model, self.data, q)
-            pin.updateFramePlacements(self.model, self.data)
-
-            current = self.data.oMf[ee_frame_id]
-            pos_err_vec = target_pos - current.translation
-            pos_err = np.linalg.norm(pos_err_vec)
-            ori_err_vec = pin.log3(target_rot.T @ current.rotation)
-            ori_err = np.linalg.norm(ori_err_vec)
-
-            if pos_err < pos_tol and ori_err < ori_tol:
-                break
-
-            error_vec = np.concatenate([pos_err_vec, -ori_err_vec])
-            J = self.numerical_jacobian(q, arm, use_orientation=True)
-            JJT = J @ J.T + damping * np.eye(6)
-
-            try:
-                Jinv = J.T @ np.linalg.solve(JJT, np.eye(6))
-            except np.linalg.LinAlgError:
-                break
-
-            # Primary task: track target pose
-            v = Jinv @ error_vec
-
-            # Nullspace projection: bias toward rest pose
-            nullspace = np.eye(n_joints) - Jinv @ J
-            q_arm = np.array([q[idx] for idx in arm_idx_q])
-            v += ARM_IK_NULLSPACE_GAIN * nullspace @ (REST_POSE - q_arm)
-
-            # Clamp max step per iteration
-            max_abs = np.max(np.abs(v))
-            if max_abs > ARM_IK_MAX_STEP:
-                v *= ARM_IK_MAX_STEP / max_abs
-
-            for i, idx_q in enumerate(arm_idx_q):
-                q[idx_q] = np.clip(q[idx_q] + dt * v[i], limits[i][0], limits[i][1])
-
-        solution = self._get_arm_from_q(q, arm)
-        for i in range(6):
-            solution[i] = np.clip(solution[i], limits[i][0], limits[i][1])
-
-        return True, solution
-
-
-# ---------------------------------------------------------------------------
 # Teleop Controller (WebXR base + cartesian arm)
 # ---------------------------------------------------------------------------
-
-def _tilt_to_vel(angle, deadzone, max_angle, max_vel):
-    """Map a tilt angle to a velocity with deadzone and clamping."""
-    if abs(angle) < deadzone:
-        return 0.0
-    frac = np.clip(angle / max_angle, -1.0, 1.0)
-    return frac * max_vel
-
 
 class TeleopController:
     """Processes WebXR messages and computes base velocity + arm targets.
@@ -348,71 +103,39 @@ class TeleopController:
     """
 
     def __init__(self, ik_controller):
-        self.ik = ik_controller
+        self.base = BaseTeleopController()
+        self.arms = ArmTeleopController(ik_controller)
 
-        # Device-to-arm mapping: {device_id: 'right'|'left'}
-        self.device_arm_map = {}
-        self.enabled_counts = {}
+        # Expose sub-controller state for backward compat
+        # (used by PhoneTeleopNode._control_loop and Flask handlers)
 
-        # Per-arm teleop state
-        self.arm_state = {
-            'right': self._new_arm_state(),
-            'left': self._new_arm_state(),
-        }
+    @property
+    def base_cmd_vel(self):
+        return self.base.base_cmd_vel
 
-        # Base control (shared — either phone can drive, latest wins)
-        self.base_xr_ref_rot_inv = {}   # {device_id: rot_inv}
-        self.base_cmd_vel = np.array([0.0, 0.0, 0.0])  # [vx, vy, wz]
-        self.base_control_active = False
-        self.base_control_device = None
+    @property
+    def base_control_active(self):
+        return self.base.base_control_active
 
-    @staticmethod
-    def _new_arm_state():
-        return {
-            'xr_ref_pos': None,
-            'xr_ref_rot_inv': None,
-            'ref_ee_pos': None,
-            'ref_ee_rot': None,
-            'target_joints': None,
-            'control_active': False,
-            'gripper_delta': 0.0,
-        }
+    @property
+    def arm_state(self):
+        return self.arms.arm_state
+
+    @property
+    def device_arm_map(self):
+        return self.arms.device_arm_map
+
+    @property
+    def enabled_counts(self):
+        return self.arms.enabled_counts
 
     def assign_device_to_arm(self, device_id, arm):
-        """Assign a device to a specific arm, clearing any conflicts."""
-        old_arm = self.device_arm_map.get(device_id)
-        if old_arm:
-            self.arm_state[old_arm] = self._new_arm_state()
-        # Swap: if another device has the target arm, give it our old arm
-        other_arm = 'left' if arm == 'right' else 'right'
-        for did, a in list(self.device_arm_map.items()):
-            if a == arm and did != device_id:
-                self.device_arm_map[did] = other_arm
-                self.arm_state[other_arm] = self._new_arm_state()
-        self.device_arm_map[device_id] = arm
+        self.arms.assign_device_to_arm(device_id, arm)
 
     def remove_device(self, device_id):
         """Clean up all state for a disconnected device."""
-        arm = self.device_arm_map.pop(device_id, None)
-        if arm:
-            self.arm_state[arm] = self._new_arm_state()
-        self.enabled_counts.pop(device_id, None)
-        self.base_xr_ref_rot_inv.pop(device_id, None)
-        if self.base_control_device == device_id:
-            self.base_cmd_vel[:] = 0.0
-            self.base_control_active = False
-            self.base_control_device = None
-
-    def _auto_assign_device(self, device_id):
-        """Auto-assign device to first available arm (right, then left)."""
-        if device_id in self.device_arm_map:
-            return
-        assigned_arms = set(self.device_arm_map.values())
-        if 'right' not in assigned_arms:
-            self.device_arm_map[device_id] = 'right'
-        elif 'left' not in assigned_arms:
-            self.device_arm_map[device_id] = 'left'
-        # else: both arms taken, device won't get arm control
+        self.arms.remove_device(device_id)
+        self.base.reset_device(device_id)
 
     def process_message(self, data, arm_positions):
         """Process a WebXR message from one device.
@@ -425,30 +148,17 @@ class TeleopController:
 
         # Update enabled count (frames with active touch)
         if 'teleop_mode' in data:
-            self.enabled_counts[device_id] = self.enabled_counts.get(device_id, 0) + 1
+            self.arms.enabled_counts[device_id] = self.arms.enabled_counts.get(device_id, 0) + 1
         else:
-            self.enabled_counts[device_id] = 0
+            self.arms.enabled_counts[device_id] = 0
 
         # Auto-assign device to an arm after warmup frames
-        if self.enabled_counts.get(device_id, 0) > 2:
-            self._auto_assign_device(device_id)
-        elif self.enabled_counts.get(device_id, 0) == 0:
-            # Touch released — reset arm XR refs but keep device-to-arm mapping
-            arm = self.device_arm_map.get(device_id)
-            if arm:
-                state = self.arm_state[arm]
-                state['xr_ref_pos'] = None
-                state['xr_ref_rot_inv'] = None
-                state['ref_ee_pos'] = None
-                state['ref_ee_rot'] = None
-                state['control_active'] = False
-                state['gripper_delta'] = 0.0
-            # Reset base ref for this device
-            self.base_xr_ref_rot_inv.pop(device_id, None)
-            if self.base_control_device == device_id:
-                self.base_cmd_vel[:] = 0.0
-                self.base_control_active = False
-                self.base_control_device = None
+        if self.arms.enabled_counts.get(device_id, 0) > 2:
+            self.arms.auto_assign_device(device_id)
+        elif self.arms.enabled_counts.get(device_id, 0) == 0:
+            # Touch released — reset refs
+            self.arms.reset_device(device_id)
+            self.base.reset_device(device_id)
 
         # Process teleop commands
         if 'teleop_mode' not in data:
@@ -458,72 +168,16 @@ class TeleopController:
 
         pos, rot = convert_webxr_pose(data['position'], data['orientation'])
 
-        # --- BASE CONTROL (tilt-based velocity) ---
         if data['teleop_mode'] == 'base':
-            if device_id not in self.base_xr_ref_rot_inv:
-                self.base_xr_ref_rot_inv[device_id] = rot.inv()
-
-            delta_rot = rot * self.base_xr_ref_rot_inv[device_id]
-            rx, ry, rz = delta_rot.as_euler('xyz')
-
-            vx = _tilt_to_vel(ry, BASE_TILT_DEADZONE,
-                              BASE_MAX_TILT_ANGLE, BASE_MAX_LINEAR_VEL)
-            vy = _tilt_to_vel(-rx, BASE_TILT_DEADZONE,
-                              BASE_MAX_TILT_ANGLE, BASE_MAX_LINEAR_VEL)
-            wz = _tilt_to_vel(rz, BASE_TILT_DEADZONE,
-                              BASE_MAX_TILT_ANGLE, BASE_MAX_ANGULAR_VEL)
-
-            self.base_cmd_vel = np.array([vx, vy, wz])
-            self.base_control_active = True
-            self.base_control_device = device_id
-
-        # --- ARM CONTROL (1:1 phone-to-EE mapping) ---
-        # Phone displacement → EE displacement, phone rotation → EE rotation
+            self.base.process(device_id, rot)
         elif data['teleop_mode'] == 'arm':
-            arm = self.device_arm_map.get(device_id)
-            if arm is None:
-                return  # Device not assigned to any arm
+            self.arms.process(
+                device_id, pos, rot, arm_positions,
+                gripper_delta=data.get('gripper_delta', 0.0))
 
-            state = self.arm_state[arm]
-            current_arm_positions = arm_positions[arm]
-
-            # On first touch: capture reference phone pose and current EE pose
-            if state['xr_ref_pos'] is None:
-                state['xr_ref_pos'] = pos.copy()
-                state['xr_ref_rot_inv'] = rot.inv()
-
-                if self.ik.available:
-                    ee_pos, ee_rot = self.ik.forward_kinematics(
-                        arm, np.array(current_arm_positions))
-                    if ee_pos is not None:
-                        state['ref_ee_pos'] = ee_pos.copy()
-                        state['ref_ee_rot'] = ee_rot.copy()
-
-            if state['ref_ee_pos'] is not None and self.ik.available:
-                # Position: ref_ee + phone displacement
-                delta_pos = pos - state['xr_ref_pos']
-                target_ee_pos = state['ref_ee_pos'] + delta_pos
-
-                # Orientation: relative phone rotation applied to ref EE orientation
-                delta_rot = rot * state['xr_ref_rot_inv']
-                target_ee_rot = delta_rot.as_matrix() @ state['ref_ee_rot']
-
-                # Solve IK
-                success, joints = self.ik.solve_ik(
-                    arm,
-                    target_ee_pos, target_ee_rot,
-                    seed=np.array(current_arm_positions),
-                    max_iter=30, dt=0.3, damping=1e-5)
-
-                if success:
-                    # Verify IK solution actually reaches the target position
-                    solved_pos, _ = self.ik.forward_kinematics(arm, joints)
-                    if (solved_pos is not None and
-                            np.linalg.norm(solved_pos - target_ee_pos) < ARM_IK_POS_TOL):
-                        state['target_joints'] = joints
-                        state['control_active'] = True
-
-            state['gripper_delta'] = data.get('gripper_delta', 0.0)
+    def emergency_stop(self):
+        self.base.reset_all()
+        self.arms.reset_all()
 
 
 class PhoneTeleopNode(Node):
@@ -616,13 +270,14 @@ class PhoneTeleopNode(Node):
         for device_id, data in latest_per_device.items():
             self.teleop.process_message(data, arm_positions)
 
-        # --- Base: publish cmd_vel ---
+        # --- Base: publish cmd_vel and track heading ---
         twist = Twist()
         if self.teleop.base_control_active:
             twist.linear.x = float(self.teleop.base_cmd_vel[0])
             twist.linear.y = float(self.teleop.base_cmd_vel[1])
             twist.angular.z = float(self.teleop.base_cmd_vel[2])
         self.cmd_vel_pub.publish(twist)
+        self.teleop.base.update_heading(twist.angular.z, dt)
 
         # --- Both arms: velocity-limited interpolation toward IK targets ---
         limits = list(JOINT_LIMITS.values())
@@ -696,14 +351,7 @@ class PhoneTeleopNode(Node):
         self.get_logger().info(f'Sent {arm} arm to preset pose')
 
     def emergency_stop(self):
-        for arm in ['right', 'left']:
-            self.teleop.arm_state[arm] = self.teleop._new_arm_state()
-        self.teleop.base_cmd_vel[:] = 0.0
-        self.teleop.base_control_active = False
-        self.teleop.base_control_device = None
-        self.teleop.device_arm_map.clear()
-        self.teleop.base_xr_ref_rot_inv.clear()
-        self.teleop.enabled_counts.clear()
+        self.teleop.emergency_stop()
         self.current_cmd_positions = {'right': None, 'left': None}
         twist = Twist()
         self.cmd_vel_pub.publish(twist)
