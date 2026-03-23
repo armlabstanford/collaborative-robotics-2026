@@ -53,6 +53,7 @@ from scipy.spatial.transform import Rotation as R
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
@@ -69,7 +70,7 @@ from tidybot_control.arm_teleop import (
 # --- Constants ---
 TWO_PI = 2.0 * math.pi
 SLEEP_POSE = [0.0, -1.80, 1.55, 0.0, 0.8, 0.0]
-HOME_POSE = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+HOME_POSE = [0.0, 0.0, 0.0, 0.0, 1.57, 0.0]
 
 # Control parameters
 CONTROL_RATE = 20                # Hz
@@ -169,7 +170,7 @@ class TeleopController:
         pos, rot = convert_webxr_pose(data['position'], data['orientation'])
 
         if data['teleop_mode'] == 'base':
-            self.base.process(device_id, rot)
+            self.base.process(device_id, pos, rot)
         elif data['teleop_mode'] == 'arm':
             self.arms.process(
                 device_id, pos, rot, arm_positions,
@@ -202,6 +203,7 @@ class PhoneTeleopNode(Node):
         self.left_arm_positions = list(SLEEP_POSE)
         self.create_subscription(JointState, '/right_arm/joint_states', self._right_js_cb, 10)
         self.create_subscription(JointState, '/left_arm/joint_states', self._left_js_cb, 10)
+        self.create_subscription(Odometry, '/odom', self._odom_cb, 10)
 
         # IK controller
         self.ik = ArmIKController(self.get_logger())
@@ -220,6 +222,7 @@ class PhoneTeleopNode(Node):
 
         # Velocity-limited arm state
         self.current_cmd_positions = {'right': None, 'left': None}
+        self.slow_mode = False
 
         # Control timer
         self.control_timer = self.create_timer(1.0 / CONTROL_RATE, self._control_loop)
@@ -233,6 +236,17 @@ class PhoneTeleopNode(Node):
     def _left_js_cb(self, msg):
         if len(msg.position) >= 6:
             self.left_arm_positions = list(msg.position[:6])
+
+    def _odom_cb(self, msg):
+        """Extract x, y, theta from odom and feed to base controller."""
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        # Extract yaw from quaternion
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        theta = math.atan2(siny_cosp, cosy_cosp)
+        self.teleop.base.update_odom(x, y, theta)
 
     def _control_loop(self):
         """Process messages and publish velocity-limited commands for both arms."""
@@ -270,14 +284,13 @@ class PhoneTeleopNode(Node):
         for device_id, data in latest_per_device.items():
             self.teleop.process_message(data, arm_positions)
 
-        # --- Base: publish cmd_vel and track heading ---
+        # --- Base: publish cmd_vel ---
         twist = Twist()
         if self.teleop.base_control_active:
             twist.linear.x = float(self.teleop.base_cmd_vel[0])
             twist.linear.y = float(self.teleop.base_cmd_vel[1])
             twist.angular.z = float(self.teleop.base_cmd_vel[2])
         self.cmd_vel_pub.publish(twist)
-        self.teleop.base.update_heading(twist.angular.z, dt)
 
         # --- Both arms: velocity-limited interpolation toward IK targets ---
         limits = list(JOINT_LIMITS.values())
@@ -290,9 +303,10 @@ class PhoneTeleopNode(Node):
                     self.current_cmd_positions[arm] = np.array(arm_positions[arm])
 
                 cmd = self.current_cmd_positions[arm].copy()
+                vel = MAX_JOINT_VELOCITY / 3.0 if self.slow_mode else MAX_JOINT_VELOCITY
                 for i in range(6):
                     diff = target[i] - cmd[i]
-                    max_step = MAX_JOINT_VELOCITY * dt
+                    max_step = vel * dt
                     if abs(diff) > max_step:
                         diff = math.copysign(max_step, diff)
                     cmd[i] += diff
@@ -450,6 +464,11 @@ def create_flask_app(ros_node: PhoneTeleopNode):
         pose_name = data.get('pose', 'sleep')
         pose = SLEEP_POSE if pose_name == 'sleep' else HOME_POSE
         ros_node.send_arm_to_pose(arm, pose)
+
+    @socketio.on('set_slow_mode')
+    def handle_set_slow_mode(data):
+        ros_node.slow_mode = data.get('enabled', False)
+        ros_node.get_logger().info(f'Slow mode: {"ON" if ros_node.slow_mode else "OFF"}')
 
     @socketio.on('emergency_stop')
     def handle_emergency_stop():
@@ -686,6 +705,8 @@ WEBXR_HTML = r"""<!doctype html>
     #arm-controls button.active { background: #4a90d9; color: #fff; border-color: #4a90d9; }
     #arm-controls .grip-btn { background: #27ae60; color: #fff; border-color: #27ae60; }
     #arm-controls .grip-btn.closed { background: #e74c3c; border-color: #e74c3c; }
+    #arm-controls .slow-btn { background: #8e44ad; color: #fff; border-color: #7d3c98; }
+    #arm-controls .slow-btn.active { background: #f39c12; border-color: #e67e22; }
     #arm-controls .preset-btn { background: #95a5a6; color: #fff; border-color: #7f8c8d; }
     #arm-controls .stop-btn { background: #c0392b; color: #fff; border-color: #a93226; font-size: 11px; }
     canvas {
@@ -701,9 +722,10 @@ WEBXR_HTML = r"""<!doctype html>
     <header></header>
     <div id="arm-controls">
       <span id="arm-label" style="font-weight:700; font-size:11px; color:#e67e22; white-space:nowrap;">Not assigned</span>
-      <button id="btn-right" onclick="selectArm('right')">Right</button>
       <button id="btn-left" onclick="selectArm('left')">Left</button>
+      <button id="btn-right" onclick="selectArm('right')">Right</button>
       <button class="grip-btn" id="grip-btn" onclick="toggleGripper()">Gripper: OPEN</button>
+      <button class="slow-btn" id="slow-btn" onclick="toggleSlow()">Slow: OFF</button>
       <button class="preset-btn" onclick="presetPose('home')">Home</button>
       <button class="preset-btn" onclick="presetPose('sleep')">Sleep</button>
       <button class="stop-btn" onclick="emergencyStop()">STOP</button>
@@ -765,6 +787,14 @@ WEBXR_HTML = r"""<!doctype html>
       const btn = document.getElementById('grip-btn');
       btn.textContent = gripperOpen ? 'Gripper: OPEN' : 'Gripper: CLOSED';
       btn.classList.toggle('closed', !gripperOpen);
+    }
+    let slowMode = false;
+    function toggleSlow() {
+      slowMode = !slowMode;
+      socket.emit('set_slow_mode', {enabled: slowMode, device_id: deviceId});
+      const btn = document.getElementById('slow-btn');
+      btn.textContent = slowMode ? 'Slow: ON' : 'Slow: OFF';
+      btn.classList.toggle('active', slowMode);
     }
     function presetPose(name) { socket.emit('preset_pose', {arm: myArm, pose: name, device_id: deviceId}); }
     function emergencyStop() { socket.emit('emergency_stop'); }
